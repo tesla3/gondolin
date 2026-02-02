@@ -133,18 +133,26 @@ fn handleExec(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: prot
     var status: ?u32 = null;
     var buffer: [8192]u8 = undefined;
 
+    const max_buffered: usize = 256 * 1024;
+
     while (true) {
         if (status != null and !stdout_open and !stderr_open and !writer.hasPending()) break;
 
         var pollfds: [3]std.posix.pollfd = undefined;
         var nfds: usize = 0;
+        var stdout_index: ?usize = null;
+        var stderr_index: ?usize = null;
         var virtio_index: ?usize = null;
 
-        if (stdout_open) {
+        const backpressure = writer.pendingBytes() >= max_buffered;
+
+        if (stdout_open and !backpressure) {
+            stdout_index = nfds;
             pollfds[nfds] = .{ .fd = stdout_pipe[0], .events = std.posix.POLL.IN, .revents = 0 };
             nfds += 1;
         }
-        if (stderr_open) {
+        if (stderr_open and !backpressure) {
+            stderr_index = nfds;
             pollfds[nfds] = .{ .fd = stderr_pipe[0], .events = std.posix.POLL.IN, .revents = 0 };
             nfds += 1;
         }
@@ -167,10 +175,8 @@ fn handleExec(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: prot
 
         _ = try std.posix.poll(pollfds[0..nfds], 100);
 
-        var index: usize = 0;
-        if (stdout_open) {
-            const revents = pollfds[index].revents;
-            index += 1;
+        if (stdout_index) |sindex| {
+            const revents = pollfds[sindex].revents;
             if ((revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
                 const n = try std.posix.read(stdout_pipe[0], buffer[0..]);
                 if (n == 0) {
@@ -185,9 +191,8 @@ fn handleExec(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: prot
             }
         }
 
-        if (stderr_open) {
-            const revents = pollfds[index].revents;
-            index += 1;
+        if (stderr_index) |sindex| {
+            const revents = pollfds[sindex].revents;
             if ((revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
                 const n = try std.posix.read(stderr_pipe[0], buffer[0..]);
                 if (n == 0) {

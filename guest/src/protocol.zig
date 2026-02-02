@@ -114,6 +114,10 @@ pub const FrameWriter = struct {
         return self.offset < self.buffer.items.len;
     }
 
+    pub fn pendingBytes(self: *FrameWriter) usize {
+        return self.buffer.items.len - self.offset;
+    }
+
     pub fn enqueue(self: *FrameWriter, payload: []const u8) !void {
         const len: u32 = @intCast(payload.len);
         var len_buf: [4]u8 = .{
