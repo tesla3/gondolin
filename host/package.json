@@ -5,13 +5,17 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/exec.js",
-    "dev": "tsx src/exec.ts"
+    "dev": "tsx src/exec.ts",
+    "dev:ws": "tsx src/ws-server.ts",
+    "test:ws": "tsx src/ws-test.ts"
   },
   "dependencies": {
-    "cbor": "^10.0.4"
+    "cbor": "^10.0.4",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",
+    "@types/ws": "^8.5.12",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"
   }

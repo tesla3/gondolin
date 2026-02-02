@@ -1,39 +1,12 @@
 import net from "net";
-import cbor from "cbor";
 
-const MAX_FRAME = 4 * 1024 * 1024;
-
-type ExecOutput = {
-  v: number;
-  t: "exec_output";
-  id: number;
-  p: {
-    stream: "stdout" | "stderr";
-    data: Buffer;
-  };
-};
-
-type ExecResponse = {
-  v: number;
-  t: "exec_response";
-  id: number;
-  p: {
-    exit_code: number;
-    signal?: number;
-  };
-};
-
-type ErrorResponse = {
-  v: number;
-  t: "error";
-  id: number;
-  p: {
-    code: string;
-    message: string;
-  };
-};
-
-type IncomingMessage = ExecOutput | ExecResponse | ErrorResponse;
+import {
+  FrameReader,
+  buildExecRequest,
+  decodeMessage,
+  encodeFrame,
+  IncomingMessage,
+} from "./virtio-protocol";
 
 type Command = {
   cmd: string;
@@ -163,52 +136,9 @@ function usage() {
   console.log("Arguments apply to the most recent --cmd.");
 }
 
-class FrameReader {
-  private buffer = Buffer.alloc(0);
-  private expectedLength: number | null = null;
 
-  push(chunk: Buffer, onFrame: (frame: Buffer) => void) {
-    this.buffer = Buffer.concat([this.buffer, chunk]);
-
-    while (true) {
-      if (this.expectedLength === null) {
-        if (this.buffer.length < 4) return;
-        this.expectedLength = this.buffer.readUInt32BE(0);
-        this.buffer = this.buffer.slice(4);
-        if (this.expectedLength > MAX_FRAME) {
-          throw new Error(`Frame too large: ${this.expectedLength}`);
-        }
-      }
-
-      if (this.buffer.length < this.expectedLength) return;
-
-      const frame = this.buffer.slice(0, this.expectedLength);
-      this.buffer = this.buffer.slice(this.expectedLength);
-      this.expectedLength = null;
-      onFrame(frame);
-    }
-  }
-}
-
-function normalize(value: unknown): unknown {
-  if (value instanceof Map) {
-    const obj: Record<string, unknown> = {};
-    for (const [key, entry] of value.entries()) {
-      obj[String(key)] = normalize(entry);
-    }
-    return obj;
-  }
-  if (Array.isArray(value)) {
-    return value.map((entry) => normalize(entry));
-  }
-  if (value instanceof Uint8Array && !Buffer.isBuffer(value)) {
-    return Buffer.from(value);
-  }
-  return value;
-}
-
-function buildExecRequest(command: Command) {
-  const payload: Record<string, unknown> = {
+function buildCommandPayload(command: Command) {
+  const payload: { cmd: string; argv?: string[]; env?: string[]; cwd?: string } = {
     cmd: command.cmd,
   };
 
@@ -216,12 +146,7 @@ function buildExecRequest(command: Command) {
   if (command.env.length > 0) payload.env = command.env;
   if (command.cwd) payload.cwd = command.cwd;
 
-  return {
-    v: 1,
-    t: "exec_request",
-    id: command.id,
-    p: payload,
-  };
+  return payload;
 }
 
 function main() {
@@ -241,11 +166,9 @@ function main() {
   const sendNext = () => {
     const command = args.commands[currentIndex];
     inflightId = command.id;
-    const message = buildExecRequest(command);
-    const payload = cbor.encode(message);
-    const header = Buffer.alloc(4);
-    header.writeUInt32BE(payload.length, 0);
-    socket.write(Buffer.concat([header, payload]));
+    const payload = buildCommandPayload(command);
+    const message = buildExecRequest(command.id, payload);
+    socket.write(encodeFrame(message));
   };
 
   const finish = (code?: number) => {
@@ -262,12 +185,9 @@ function main() {
 
   socket.on("data", (chunk) => {
     reader.push(chunk, (frame) => {
-      const raw = cbor.decodeFirstSync(frame);
-      const message = normalize(raw) as IncomingMessage;
+      const message = decodeMessage(frame) as IncomingMessage;
       if (message.t === "exec_output") {
-        const data = Buffer.isBuffer(message.p.data)
-          ? message.p.data
-          : Buffer.from(message.p.data as unknown as Uint8Array);
+        const data = message.p.data;
         if (message.p.stream === "stdout") {
           process.stdout.write(data);
         } else {
