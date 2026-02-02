@@ -13,63 +13,49 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    consoleWrite("[sandboxd] starting\n");
-    var logged_open = false;
+    log.info("starting", .{});
+
+    var virtio = try openVirtioPort();
+    defer virtio.close();
+    const virtio_fd: std.posix.fd_t = virtio.handle;
+
+    log.info("opened virtio port", .{});
+
+    var waiting_for_reconnect = false;
 
     while (true) {
-        var virtio = try openVirtioPort();
-        defer virtio.close();
-        const virtio_fd: std.posix.fd_t = virtio.handle;
-
-        if (!logged_open) {
-            log.info("opened virtio port", .{});
-            consoleWrite("[sandboxd] opened virtio port\n");
-            logged_open = true;
-        }
-
-        var had_activity = false;
-
-        while (true) {
-            const frame = protocol.readFrame(allocator, virtio_fd) catch |err| {
-                if (err == error.EndOfStream) {
-                    if (had_activity) {
-                        log.info("virtio port closed, waiting for reconnect", .{});
-                        consoleWrite("[sandboxd] virtio port closed, waiting for reconnect\n");
-                    }
-                    break;
+        const frame = protocol.readFrame(allocator, virtio_fd) catch |err| {
+            if (err == error.EndOfStream) {
+                if (!waiting_for_reconnect) {
+                    log.info("virtio port closed, waiting for reconnect", .{});
+                    waiting_for_reconnect = true;
                 }
-                log.err("failed to read frame: {s}", .{@errorName(err)});
+                waitForVirtioData(virtio_fd);
                 continue;
-            };
-            defer allocator.free(frame);
-
-            had_activity = true;
-            log.info("received frame ({} bytes)", .{frame.len});
-            const req = protocol.decodeExecRequest(allocator, frame) catch |err| {
-                log.err("invalid exec_request: {s}", .{@errorName(err)});
-                _ = protocol.sendError(allocator, virtio_fd, 0, "invalid_request", "invalid exec_request") catch {};
-                continue;
-            };
-            log.info("exec request id={} cmd={s}", .{ req.id, req.cmd });
-            defer {
-                allocator.free(req.argv);
-                allocator.free(req.env);
             }
+            log.err("failed to read frame: {s}", .{@errorName(err)});
+            continue;
+        };
+        defer allocator.free(frame);
 
-            handleExec(allocator, virtio_fd, req) catch |err| {
-                log.err("exec handling failed: {s}", .{@errorName(err)});
-                _ = protocol.sendError(allocator, virtio_fd, req.id, "exec_failed", "failed to execute") catch {};
-            };
+        waiting_for_reconnect = false;
+        log.info("received frame ({} bytes)", .{frame.len});
+        const req = protocol.decodeExecRequest(allocator, frame) catch |err| {
+            log.err("invalid exec_request: {s}", .{@errorName(err)});
+            _ = protocol.sendError(allocator, virtio_fd, 0, "invalid_request", "invalid exec_request") catch {};
+            continue;
+        };
+        log.info("exec request id={} cmd={s}", .{ req.id, req.cmd });
+        defer {
+            allocator.free(req.argv);
+            allocator.free(req.env);
         }
 
-        std.posix.nanosleep(1, 0);
+        handleExec(allocator, virtio_fd, req) catch |err| {
+            log.err("exec handling failed: {s}", .{@errorName(err)});
+            _ = protocol.sendError(allocator, virtio_fd, req.id, "exec_failed", "failed to execute") catch {};
+        };
     }
-}
-
-fn consoleWrite(message: []const u8) void {
-    const file = std.fs.openFileAbsolute("/dev/console", .{ .mode = .write_only }) catch return;
-    defer file.close();
-    _ = file.writeAll(message) catch {};
 }
 
 fn openVirtioPort() !std.fs.File {
@@ -97,11 +83,32 @@ fn openVirtioPort() !std.fs.File {
         }
 
         if (!warned) {
-            consoleWrite("[sandboxd] waiting for virtio port\n");
+            log.info("waiting for virtio port", .{});
             warned = true;
         }
 
         std.posix.nanosleep(0, 100 * std.time.ns_per_ms);
+    }
+}
+
+fn waitForVirtioData(virtio_fd: std.posix.fd_t) void {
+    while (true) {
+        var pollfds: [1]std.posix.pollfd = .{.{
+            .fd = virtio_fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+
+        const res = std.posix.poll(pollfds[0..], -1) catch return;
+        if (res <= 0) continue;
+
+        const revents = pollfds[0].revents;
+        if ((revents & std.posix.POLL.HUP) != 0) {
+            std.posix.nanosleep(0, 100 * std.time.ns_per_ms);
+            continue;
+        }
+
+        if ((revents & std.posix.POLL.IN) != 0) return;
     }
 }
 

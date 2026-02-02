@@ -35,17 +35,30 @@ type ErrorResponse = {
 
 type IncomingMessage = ExecOutput | ExecResponse | ErrorResponse;
 
-type Args = {
-  sock?: string;
-  cmd?: string;
+type Command = {
+  cmd: string;
   argv: string[];
   env: string[];
   cwd?: string;
   id: number;
 };
 
+type Args = {
+  sock?: string;
+  commands: Command[];
+};
+
 function parseArgs(argv: string[]): Args {
-  const args: Args = { argv: [], env: [], id: 1 };
+  const args: Args = { commands: [] };
+  let current: Command | null = null;
+  let nextId = 1;
+
+  const fail = (message: string) => {
+    console.error(message);
+    usage();
+    process.exit(1);
+  };
+
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     switch (arg) {
@@ -53,35 +66,43 @@ function parseArgs(argv: string[]): Args {
         args.sock = argv[++i];
         break;
       case "--cmd":
-        args.cmd = argv[++i];
+        current = { cmd: argv[++i], argv: [], env: [], id: nextId++ };
+        args.commands.push(current);
         break;
       case "--arg":
-        args.argv.push(argv[++i]);
+        if (!current) fail("--arg requires --cmd");
+        current.argv.push(argv[++i]);
         break;
       case "--env":
-        args.env.push(argv[++i]);
+        if (!current) fail("--env requires --cmd");
+        current.env.push(argv[++i]);
         break;
       case "--cwd":
-        args.cwd = argv[++i];
+        if (!current) fail("--cwd requires --cmd");
+        current.cwd = argv[++i];
         break;
       case "--id":
-        args.id = Number(argv[++i]);
+        if (!current) fail("--id requires --cmd");
+        current.id = Number(argv[++i]);
+        if (!Number.isFinite(current.id)) fail("--id must be a number");
+        if (current.id >= nextId) nextId = current.id + 1;
         break;
       case "--help":
       case "-h":
         usage();
         process.exit(0);
       default:
-        console.error(`Unknown argument: ${arg}`);
-        usage();
-        process.exit(1);
+        fail(`Unknown argument: ${arg}`);
     }
   }
   return args;
 }
 
 function usage() {
-  console.log("Usage: node dist/exec.js --sock PATH --cmd CMD [--arg ARG] [--env KEY=VALUE] [--cwd PATH]");
+  console.log(
+    "Usage: node dist/exec.js --sock PATH --cmd CMD [--arg ARG] [--env KEY=VALUE] [--cwd PATH] [--cmd CMD ...]"
+  );
+  console.log("Arguments apply to the most recent --cmd.");
 }
 
 class FrameReader {
@@ -128,40 +149,57 @@ function normalize(value: unknown): unknown {
   return value;
 }
 
-function buildExecRequest(args: Args) {
+function buildExecRequest(command: Command) {
   const payload: Record<string, unknown> = {
-    cmd: args.cmd,
+    cmd: command.cmd,
   };
 
-  if (args.argv.length > 0) payload.argv = args.argv;
-  if (args.env.length > 0) payload.env = args.env;
-  if (args.cwd) payload.cwd = args.cwd;
+  if (command.argv.length > 0) payload.argv = command.argv;
+  if (command.env.length > 0) payload.env = command.env;
+  if (command.cwd) payload.cwd = command.cwd;
 
   return {
     v: 1,
     t: "exec_request",
-    id: args.id,
+    id: command.id,
     p: payload,
   };
 }
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  if (!args.sock || !args.cmd) {
+  if (!args.sock || args.commands.length === 0) {
     usage();
     process.exit(1);
   }
 
   const socket = net.createConnection({ path: args.sock });
   const reader = new FrameReader();
+  let currentIndex = 0;
+  let inflightId: number | null = null;
+  let exitCode = 0;
+  let closing = false;
 
-  socket.on("connect", () => {
-    console.log(`connected to ${args.sock}`);
-    const message = buildExecRequest(args);
+  const sendNext = () => {
+    const command = args.commands[currentIndex];
+    inflightId = command.id;
+    const message = buildExecRequest(command);
     const payload = cbor.encode(message);
     const header = Buffer.alloc(4);
     header.writeUInt32BE(payload.length, 0);
     socket.write(Buffer.concat([header, payload]));
+  };
+
+  const finish = (code?: number) => {
+    if (code !== undefined && exitCode === 0) exitCode = code;
+    if (closing) return;
+    closing = true;
+    socket.end();
+  };
+
+  socket.on("connect", () => {
+    console.log(`connected to ${args.sock}`);
+    sendNext();
   });
 
   socket.on("data", (chunk) => {
@@ -178,28 +216,41 @@ function main() {
           process.stderr.write(data);
         }
       } else if (message.t === "exec_response") {
+        if (inflightId !== null && message.id !== inflightId) {
+          console.error(`unexpected response id ${message.id} (expected ${inflightId})`);
+          finish(1);
+          return;
+        }
         const code = message.p.exit_code ?? 1;
         const signal = message.p.signal;
         if (signal !== undefined) {
           console.error(`process exited due to signal ${signal}`);
         }
-        socket.end();
-        process.exit(code);
+        if (code !== 0 && exitCode === 0) exitCode = code;
+        currentIndex += 1;
+        if (currentIndex < args.commands.length) {
+          sendNext();
+        } else {
+          finish();
+        }
       } else if (message.t === "error") {
         console.error(`error ${message.p.code}: ${message.p.message}`);
-        socket.end();
-        process.exit(1);
+        finish(1);
       }
     });
   });
 
   socket.on("error", (err) => {
     console.error(`socket error: ${err.message}`);
-    process.exit(1);
+    finish(1);
   });
 
   socket.on("end", () => {
-    process.exit(1);
+    if (!closing && exitCode === 0) exitCode = 1;
+  });
+
+  socket.on("close", () => {
+    process.exit(exitCode);
   });
 }
 
