@@ -3,3 +3,4 @@ zig-cache/
 zig-out/
 guest/zig-cache/
 guest/zig-out/
+guest/.zig-cache/
