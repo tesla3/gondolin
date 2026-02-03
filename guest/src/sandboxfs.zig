@@ -351,10 +351,19 @@ const SandboxFs = struct {
     pub fn run(self: *SandboxFs) !void {
         var buffer: [128 * 1024]u8 = undefined;
         while (true) {
-            const request = try readFuseRequest(self.fuse_fd, buffer[0..]);
-            const header = try parseInHeader(request);
+            const request = readFuseRequest(self.fuse_fd, buffer[0..]) catch |err| {
+                log.err("read fuse request failed: {s}", .{@errorName(err)});
+                return err;
+            };
+            const header = parseInHeader(request) catch |err| {
+                log.err("parse fuse header failed: {s}", .{@errorName(err)});
+                return err;
+            };
             const payload = request[@sizeOf(FuseInHeader)..];
-            try self.handleRequest(header, payload);
+            self.handleRequest(header, payload) catch |err| {
+                log.err("handle opcode {} failed: {s}", .{ header.opcode, @errorName(err) });
+                return err;
+            };
         }
     }
 
@@ -382,14 +391,14 @@ const SandboxFs = struct {
 
     fn handleInit(self: *SandboxFs, header: FuseInHeader, payload: []const u8) !void {
         const init_in = try parseFuseInit(payload);
-        const flags = init_in.flags;
-        _ = flags;
+        const supported_flags: u32 = (1 << 5);
+        const enabled_flags = init_in.flags & supported_flags;
 
         const out = FuseInitOut{
-            .major = 7,
-            .minor = 31,
+            .major = init_in.major,
+            .minor = init_in.minor,
             .max_readahead = init_in.max_readahead,
-            .flags = (1 << 5),
+            .flags = enabled_flags,
             .max_background = 0,
             .congestion_threshold = 0,
             .max_write = MAX_RPC_DATA,
@@ -843,7 +852,10 @@ pub fn main() !void {
     var sandboxfs = SandboxFs.init(allocator, fuse_fd, rpc_client);
     defer sandboxfs.deinit();
 
-    try sandboxfs.run();
+    sandboxfs.run() catch |err| {
+        log.err("sandboxfs failed: {s}", .{@errorName(err)});
+        return err;
+    };
 }
 
 fn mountFuse(allocator: std.mem.Allocator, fuse_fd: std.posix.fd_t, mount_point: []const u8) !void {
@@ -874,7 +886,38 @@ fn makeZ(allocator: std.mem.Allocator, text: []const u8) ![:0]u8 {
 }
 
 fn openRpcPort(path: []const u8) ?std.posix.fd_t {
-    return std.posix.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch null;
+    return std.posix.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch {
+        const expected = std.fs.path.basename(path);
+        return openVirtioPortByName(expected);
+    };
+}
+
+fn openVirtioPortByName(expected: []const u8) ?std.posix.fd_t {
+    var dev_dir = std.fs.openDirAbsolute("/dev", .{ .iterate = true }) catch return null;
+    defer dev_dir.close();
+
+    var it = dev_dir.iterate();
+    var path_buf: [64]u8 = undefined;
+    while (it.next() catch null) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, "vport")) continue;
+        if (!virtioPortMatches(entry.name, expected)) continue;
+        const path = std.fmt.bufPrint(&path_buf, "/dev/{s}", .{entry.name}) catch continue;
+        return std.posix.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch continue;
+    }
+
+    return null;
+}
+
+fn virtioPortMatches(port_name: []const u8, expected: []const u8) bool {
+    var path_buf: [128]u8 = undefined;
+    const sys_path = std.fmt.bufPrint(&path_buf, "/sys/class/virtio-ports/{s}/name", .{port_name}) catch return false;
+    var file = std.fs.openFileAbsolute(sys_path, .{}) catch return false;
+    defer file.close();
+
+    var name_buf: [64]u8 = undefined;
+    const size = file.readAll(&name_buf) catch return false;
+    const trimmed = std.mem.trim(u8, name_buf[0..size], " \r\n\t");
+    return std.mem.eql(u8, trimmed, expected);
 }
 
 fn readFuseRequest(fd: std.posix.fd_t, buffer: []u8) ![]u8 {
@@ -1049,10 +1092,16 @@ fn sendResponse(fd: std.posix.fd_t, unique: u64, err: i32, payload: []const u8) 
         .unique = unique,
     };
 
-    try writeAll(fd, std.mem.asBytes(&out));
-    if (payload.len > 0) {
-        try writeAll(fd, payload);
+    if (payload.len == 0) {
+        try writeAll(fd, std.mem.asBytes(&out));
+        return;
     }
+
+    var iovecs = [_]std.posix.iovec_const{
+        .{ .base = std.mem.asBytes(&out).ptr, .len = @sizeOf(FuseOutHeader) },
+        .{ .base = payload.ptr, .len = payload.len },
+    };
+    try writevAll(fd, &iovecs);
 }
 
 fn writeAll(fd: std.posix.fd_t, data: []const u8) !void {
@@ -1061,6 +1110,40 @@ fn writeAll(fd: std.posix.fd_t, data: []const u8) !void {
         const n = try std.posix.write(fd, data[offset..]);
         if (n == 0) return error.EndOfStream;
         offset += n;
+    }
+}
+
+fn writevAll(fd: std.posix.fd_t, iovecs: []const std.posix.iovec_const) !void {
+    var local_iovecs: [2]std.posix.iovec_const = undefined;
+    if (iovecs.len > local_iovecs.len) return error.InvalidRequest;
+
+    for (iovecs, 0..) |vec, idx| {
+        local_iovecs[idx] = vec;
+    }
+
+    var slice = local_iovecs[0..iovecs.len];
+    var remaining: usize = 0;
+    for (slice) |vec| {
+        remaining += vec.len;
+    }
+
+    while (remaining > 0) {
+        const written = try std.posix.writev(fd, slice);
+        if (written == 0) return error.EndOfStream;
+        remaining -= written;
+
+        var consumed = written;
+        var index: usize = 0;
+        while (index < slice.len and consumed >= slice[index].len) : (index += 1) {
+            consumed -= slice[index].len;
+        }
+
+        slice = slice[index..];
+        if (slice.len == 0) return;
+        if (consumed > 0) {
+            slice[0].base = @ptrFromInt(@intFromPtr(slice[0].base) + consumed);
+            slice[0].len -= consumed;
+        }
     }
 }
 

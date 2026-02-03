@@ -473,9 +473,9 @@ function statsToAttr(ino: number, stats: VfsStats) {
     uid: stats.uid,
     gid: stats.gid,
     size: stats.size,
-    atime_ns: Math.round(stats.atimeMs * 1_000_000),
-    mtime_ns: Math.round(stats.mtimeMs * 1_000_000),
-    ctime_ns: Math.round(stats.ctimeMs * 1_000_000),
+    atime_ms: Math.round(stats.atimeMs),
+    mtime_ms: Math.round(stats.mtimeMs),
+    ctime_ms: Math.round(stats.ctimeMs),
   };
 }
 
