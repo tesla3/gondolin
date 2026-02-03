@@ -872,22 +872,27 @@ export class QemuNetworkBackend extends EventEmitter {
     const caCertPath = path.join(mitmDir, "ca.crt");
 
     if (!fs.existsSync(caKeyPath) || !fs.existsSync(caCertPath)) {
-      execFileSync("openssl", [
-        "req",
-        "-x509",
-        "-newkey",
-        "rsa:2048",
-        "-sha256",
-        "-days",
-        "3650",
-        "-nodes",
-        "-subj",
-        "/CN=gondolin-mitm-ca",
-        "-keyout",
-        caKeyPath,
-        "-out",
-        caCertPath,
-      ]);
+      // XXX: openssl invocations here are synchronous and block the event loop.
+      execFileSync(
+        "openssl",
+        [
+          "req",
+          "-x509",
+          "-newkey",
+          "rsa:2048",
+          "-sha256",
+          "-days",
+          "3650",
+          "-nodes",
+          "-subj",
+          "/CN=gondolin-mitm-ca",
+          "-keyout",
+          caKeyPath,
+          "-out",
+          caCertPath,
+        ],
+        { stdio: "ignore" }
+      );
 
       if (this.options.debug) {
         this.emit("log", `[net] generated mitm CA at ${caCertPath}`);
@@ -961,37 +966,46 @@ export class QemuNetworkBackend extends EventEmitter {
 
     fs.writeFileSync(configPath, config);
 
-    execFileSync("openssl", ["genrsa", "-out", keyPath, "2048"]);
-    execFileSync("openssl", [
-      "req",
-      "-new",
-      "-key",
-      keyPath,
-      "-out",
-      csrPath,
-      "-config",
-      configPath,
-    ]);
-    execFileSync("openssl", [
-      "x509",
-      "-req",
-      "-in",
-      csrPath,
-      "-CA",
-      this.caCertPath,
-      "-CAkey",
-      this.caKeyPath,
-      "-CAcreateserial",
-      "-out",
-      certPath,
-      "-days",
-      "825",
-      "-sha256",
-      "-extfile",
-      configPath,
-      "-extensions",
-      "v3_req",
-    ]);
+    // XXX: openssl invocations here are synchronous and block the event loop.
+    execFileSync("openssl", ["genrsa", "-out", keyPath, "2048"], { stdio: "ignore" });
+    execFileSync(
+      "openssl",
+      [
+        "req",
+        "-new",
+        "-key",
+        keyPath,
+        "-out",
+        csrPath,
+        "-config",
+        configPath,
+      ],
+      { stdio: "ignore" }
+    );
+    execFileSync(
+      "openssl",
+      [
+        "x509",
+        "-req",
+        "-in",
+        csrPath,
+        "-CA",
+        this.caCertPath,
+        "-CAkey",
+        this.caKeyPath,
+        "-CAcreateserial",
+        "-out",
+        certPath,
+        "-days",
+        "825",
+        "-sha256",
+        "-extfile",
+        configPath,
+        "-extensions",
+        "v3_req",
+      ],
+      { stdio: "ignore" }
+    );
 
     fs.rmSync(csrPath, { force: true });
     fs.rmSync(configPath, { force: true });
