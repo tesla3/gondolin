@@ -7,6 +7,18 @@ const IP_PROTO_TCP = 6;
 const IP_PROTO_UDP = 17;
 const IP_PROTO_ICMP = 1;
 
+const HTTP_METHODS = [
+  "GET",
+  "POST",
+  "PUT",
+  "PATCH",
+  "DELETE",
+  "HEAD",
+  "OPTIONS",
+  "CONNECT",
+  "TRACE",
+];
+
 // DHCP Constants
 const DHCP_SERVER_PORT = 67;
 const DHCP_CLIENT_PORT = 68;
@@ -63,6 +75,18 @@ export type TcpResumeMessage = {
   key: string;
 };
 
+export type TcpFlowProtocol = "http" | "tls";
+
+export type TcpFlowInfo = {
+  key: string;
+  srcIP: string;
+  srcPort: number;
+  dstIP: string;
+  dstPort: number;
+  protocol: TcpFlowProtocol;
+  httpMethod?: string;
+};
+
 export type NetworkCallbacks = {
   onUdpSend: (message: UdpSendMessage) => void;
   onTcpConnect: (message: TcpConnectMessage) => void;
@@ -82,6 +106,9 @@ type TcpSession = {
   vmAck: number;
   mySeq: number;
   myAck: number;
+  flowProtocol: TcpFlowProtocol | null;
+  pendingData: Buffer;
+  httpMethod?: string;
 };
 
 export type NetworkStackOptions = {
@@ -90,6 +117,7 @@ export type NetworkStackOptions = {
   gatewayMac?: Buffer;
   vmMac?: Buffer;
   callbacks: NetworkCallbacks;
+  allowTcpFlow?: (info: TcpFlowInfo) => boolean;
 };
 
 export class NetworkStack extends EventEmitter {
@@ -99,7 +127,10 @@ export class NetworkStack extends EventEmitter {
   vmMac: Buffer | null;
 
   private readonly callbacks: NetworkCallbacks;
+  private readonly allowTcpFlow: (info: TcpFlowInfo) => boolean;
   private readonly natTable = new Map<string, TcpSession>();
+
+  private readonly MAX_FLOW_SNIFF = 8 * 1024;
 
   private rxBuffer = Buffer.alloc(0);
   private txBuffer = Buffer.alloc(0);
@@ -117,6 +148,7 @@ export class NetworkStack extends EventEmitter {
     this.vmMac =
       options.vmMac ?? Buffer.from([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
     this.callbacks = options.callbacks;
+    this.allowTcpFlow = options.allowTcpFlow ?? (() => true);
   }
 
   reset() {
@@ -326,6 +358,77 @@ export class NetworkStack extends EventEmitter {
     }
   }
 
+  private looksLikeTlsClientHello(data: Buffer) {
+    if (data.length < 5) return false;
+    if (data[0] !== 0x16) return false; // handshake
+    if (data[1] !== 0x03) return false; // TLS major version
+    return data[2] >= 0x00 && data[2] <= 0x03;
+  }
+
+  private matchHttpMethodPrefix(data: Buffer) {
+    const snippet = data.toString("ascii", 0, Math.min(data.length, 16));
+    for (const method of HTTP_METHODS) {
+      if (snippet.startsWith(`${method} `)) {
+        return { status: "match", method } as const;
+      }
+      if (method.startsWith(snippet)) {
+        return { status: "partial" } as const;
+      }
+    }
+    return { status: "none" } as const;
+  }
+
+  private parseHttpRequestLine(data: Buffer) {
+    const lineEnd = data.indexOf("\r\n");
+    if (lineEnd === -1) return null;
+    const line = data.subarray(0, lineEnd).toString("ascii");
+    const [method, target, version] = line.split(" ");
+    if (!method || !target || !version) return null;
+    if (!version.startsWith("HTTP/")) return null;
+    if (!HTTP_METHODS.includes(method)) return null;
+    return { method, target, version };
+  }
+
+  private classifyTcpFlow(data: Buffer) {
+    if (data.length === 0) {
+      return { status: "need-more" } as const;
+    }
+
+    if (this.looksLikeTlsClientHello(data)) {
+      return { status: "tls" } as const;
+    }
+
+    const prefix = this.matchHttpMethodPrefix(data);
+    if (prefix.status === "match") {
+      const requestLine = this.parseHttpRequestLine(data);
+      if (!requestLine) {
+        return { status: "need-more" } as const;
+      }
+      return {
+        status: "http",
+        method: requestLine.method,
+        isConnect: requestLine.method === "CONNECT",
+      } as const;
+    }
+
+    if (prefix.status === "partial") {
+      return { status: "need-more" } as const;
+    }
+
+    if (data.length < 4) {
+      return { status: "need-more" } as const;
+    }
+
+    return { status: "deny", reason: "unknown-protocol" } as const;
+  }
+
+  private rejectTcpFlow(session: TcpSession, key: string, ack: number, reason: string) {
+    this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort, session.mySeq, ack, 0x14);
+    this.callbacks.onTcpClose({ key, destroy: true });
+    this.natTable.delete(key);
+    this.emit("tcp-deny", { key, reason });
+  }
+
   handleTCP(segment: Buffer, srcIP: Buffer, dstIP: Buffer) {
     const srcPort = segment.readUInt16BE(0);
     const dstPort = segment.readUInt16BE(2);
@@ -361,6 +464,8 @@ export class NetworkStack extends EventEmitter {
         vmAck: ack,
         mySeq: Math.floor(Math.random() * 0x0fffffff),
         myAck: seq + 1,
+        flowProtocol: null,
+        pendingData: Buffer.alloc(0),
       };
       this.natTable.set(key, session);
 
@@ -382,9 +487,60 @@ export class NetworkStack extends EventEmitter {
     }
 
     if (payload.length > 0) {
-      this.callbacks.onTcpSend({ key, data: Buffer.from(payload) });
+      let sendBuffer: Buffer | null = null;
+      const nextAck = session.myAck + payload.length;
+
+      if (!session.flowProtocol) {
+        session.pendingData = Buffer.concat([session.pendingData, payload]);
+        const classification = this.classifyTcpFlow(session.pendingData);
+
+        if (classification.status === "need-more") {
+          if (session.pendingData.length >= this.MAX_FLOW_SNIFF) {
+            this.rejectTcpFlow(session, key, nextAck, "sniff-limit-exceeded");
+            return;
+          }
+        } else if (classification.status === "deny") {
+          this.rejectTcpFlow(session, key, nextAck, classification.reason);
+          return;
+        } else if (classification.status === "http") {
+          if (classification.isConnect) {
+            this.rejectTcpFlow(session, key, nextAck, "connect-not-allowed");
+            return;
+          }
+          session.flowProtocol = "http";
+          session.httpMethod = classification.method;
+        } else if (classification.status === "tls") {
+          session.flowProtocol = "tls";
+        }
+
+        if (session.flowProtocol) {
+          const allowed = this.allowTcpFlow({
+            key,
+            srcIP: session.srcIP.join("."),
+            srcPort: session.srcPort,
+            dstIP: session.dstIP.join("."),
+            dstPort: session.dstPort,
+            protocol: session.flowProtocol,
+            httpMethod: session.httpMethod,
+          });
+          if (!allowed) {
+            this.rejectTcpFlow(session, key, nextAck, "policy-deny");
+            return;
+          }
+          sendBuffer = session.pendingData;
+          session.pendingData = Buffer.alloc(0);
+        }
+      } else {
+        sendBuffer = payload;
+      }
+
       session.vmSeq += payload.length;
-      session.myAck += payload.length;
+      session.myAck = nextAck;
+
+      if (sendBuffer && sendBuffer.length > 0) {
+        this.callbacks.onTcpSend({ key, data: Buffer.from(sendBuffer) });
+      }
+
       this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort, session.mySeq, session.myAck, 0x10);
     }
 
