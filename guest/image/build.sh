@@ -26,6 +26,7 @@ INITRAMFS="${OUT_DIR}/initramfs.cpio.gz"
 CACHE_DIR="${IMAGE_DIR}/.cache"
 
 SANDBOXD_BIN=${SANDBOXD_BIN:-"${GUEST_DIR}/zig-out/bin/sandboxd"}
+SANDBOXFS_BIN=${SANDBOXFS_BIN:-"${GUEST_DIR}/zig-out/bin/sandboxfs"}
 
 ALPINE_TARBALL="alpine-minirootfs-${ALPINE_VERSION}-${ARCH}.tar.gz"
 ALPINE_URL=${ALPINE_URL:-"https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/releases/${ARCH}/${ALPINE_TARBALL}"}
@@ -46,8 +47,8 @@ require_cmd python3
 
 mkdir -p "${CACHE_DIR}" "${OUT_DIR}"
 
-if [[ ! -f "${SANDBOXD_BIN}" ]]; then
-    echo "sandboxd binary not found, building..." >&2
+if [[ ! -f "${SANDBOXD_BIN}" || ! -f "${SANDBOXFS_BIN}" ]]; then
+    echo "guest binaries not found, building..." >&2
     (cd "${GUEST_DIR}" && ${ZIG:-zig} build -Doptimize=ReleaseSmall)
 fi
 
@@ -179,6 +180,7 @@ PY
 fi
 
 install -m 0755 "${SANDBOXD_BIN}" "${ROOTFS_DIR}/usr/bin/sandboxd"
+install -m 0755 "${SANDBOXFS_BIN}" "${ROOTFS_DIR}/usr/bin/sandboxfs"
 install -m 0755 "${IMAGE_DIR}/init" "${ROOTFS_DIR}/init"
 
 if [[ -n "${MITM_CA_CERT:-}" && -f "${MITM_CA_CERT}" ]]; then

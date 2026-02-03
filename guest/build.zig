@@ -27,6 +27,20 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const fs_exe = b.addExecutable(.{
+        .name = "sandboxfs",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sandboxfs.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "sandboxd", .module = mod },
+            },
+        }),
+    });
+    fs_exe.linkLibC();
+    b.installArtifact(fs_exe);
+
     const mod_tests = b.addTest(.{
         .name = "sandboxd-mod-tests",
         .root_module = mod,

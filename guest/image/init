@@ -88,6 +88,21 @@ if command -v udhcpc > /dev/null 2>&1; then
   fi
 fi
 
+if modprobe fuse > /dev/null 2>&1; then
+  log "[init] loaded fuse"
+fi
+
+mkdir -p /data
+
+if [ -x /usr/bin/sandboxfs ]; then
+  log "[init] starting sandboxfs"
+  SANDBOXFS_LOG="${CONSOLE:-/dev/null}"
+  if [ -z "${SANDBOXFS_LOG}" ]; then
+    SANDBOXFS_LOG="/dev/null"
+  fi
+  /usr/bin/sandboxfs --mount /data --rpc-path /dev/vport0p2 > "${SANDBOXFS_LOG}" 2>&1 &
+fi
+
 log "[init] starting sandboxd"
 
 exec /usr/bin/sandboxd
