@@ -14,6 +14,8 @@ export type SandboxConfig = {
   accel?: string;
   cpu?: string;
   console?: "stdio" | "none";
+  netSocketPath?: string;
+  netMac?: string;
   autoRestart: boolean;
 };
 
@@ -160,6 +162,15 @@ function buildQemuArgs(config: SandboxConfig) {
     "-device",
     "virtserialport,chardev=virtiocon0,name=virtio-port,bus=virtio-serial0.0"
   );
+
+  if (config.netSocketPath) {
+    args.push(
+      "-netdev",
+      `stream,id=net0,server=off,addr.type=unix,addr.path=${config.netSocketPath}`
+    );
+    const mac = config.netMac ?? "02:00:00:00:00:01";
+    args.push("-device", `virtio-net-pci,netdev=net0,mac=${mac}`);
+  }
 
   return args;
 }

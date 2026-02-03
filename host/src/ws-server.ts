@@ -22,6 +22,7 @@ import {
   ServerMessage,
 } from "./ws-protocol";
 import { SandboxController, SandboxConfig } from "./sandbox-controller";
+import { QemuNetworkBackend } from "./qemu-net";
 
 type Args = {
   host: string;
@@ -32,6 +33,10 @@ type Args = {
   memory: string;
   cpus: number;
   virtioSocketPath: string;
+  netSocketPath: string;
+  netMac: string;
+  netEnabled: boolean;
+  netDebug: boolean;
   machineType?: string;
   accel?: string;
   cpu?: string;
@@ -62,6 +67,8 @@ function parseArgs(argv: string[]): Args {
   const defaultKernel = path.resolve(repoRoot, "guest/image/out/vmlinuz-virt");
   const defaultInitrd = path.resolve(repoRoot, "guest/image/out/initramfs.cpio.gz");
   const defaultVirtio = path.resolve(repoRoot, "tmp/virtio.sock");
+  const defaultNetSock = path.resolve(repoRoot, "tmp/net.sock");
+  const defaultNetMac = "02:00:00:00:00:01";
 
   const hostArch = detectHostArch();
   const defaultQemu = hostArch === "arm64" ? "qemu-system-aarch64" : "qemu-system-x86_64";
@@ -76,6 +83,10 @@ function parseArgs(argv: string[]): Args {
     memory: defaultMemory,
     cpus: 1,
     virtioSocketPath: defaultVirtio,
+    netSocketPath: defaultNetSock,
+    netMac: defaultNetMac,
+    netEnabled: true,
+    netDebug: false,
     autoRestart: true,
   };
 
@@ -116,6 +127,18 @@ function parseArgs(argv: string[]): Args {
         break;
       case "--virtio-sock":
         args.virtioSocketPath = argv[++i];
+        break;
+      case "--net-sock":
+        args.netSocketPath = argv[++i];
+        break;
+      case "--net-mac":
+        args.netMac = argv[++i];
+        break;
+      case "--no-net":
+        args.netEnabled = false;
+        break;
+      case "--net-debug":
+        args.netDebug = true;
         break;
       case "--machine":
         args.machineType = argv[++i];
@@ -158,6 +181,10 @@ function usage() {
   console.log("  --memory SIZE        Memory size (default 256M)");
   console.log("  --cpus N             vCPU count (default 1)");
   console.log("  --virtio-sock PATH   Virtio serial socket path");
+  console.log("  --net-sock PATH      QEMU net socket path");
+  console.log("  --net-mac MAC        MAC address for virtio-net");
+  console.log("  --no-net             Disable QEMU net backend");
+  console.log("  --net-debug          Enable net backend debug logging");
   console.log("  --machine TYPE       Override QEMU machine type");
   console.log("  --accel TYPE         Override QEMU accel (kvm/hvf/tcg)");
   console.log("  --cpu TYPE           Override QEMU CPU type");
@@ -326,6 +353,14 @@ const MAX_REQUEST_ID = 0xffffffff;
 const MAX_JSON_BYTES = 256 * 1024;
 const MAX_STDIN_BYTES = 64 * 1024;
 
+function parseMac(value: string): Buffer | null {
+  const parts = value.split(":");
+  if (parts.length !== 6) return null;
+  const bytes = parts.map((part) => Number.parseInt(part, 16));
+  if (bytes.some((byte) => !Number.isFinite(byte) || byte < 0 || byte > 255)) return null;
+  return Buffer.from(bytes);
+}
+
 function isValidRequestId(value: unknown): value is number {
   return Number.isInteger(value) && value >= 0 && value <= MAX_REQUEST_ID;
 }
@@ -388,6 +423,8 @@ function main() {
     memory: args.memory,
     cpus: args.cpus,
     virtioSocketPath: args.virtioSocketPath,
+    netSocketPath: args.netEnabled ? args.netSocketPath : undefined,
+    netMac: args.netMac,
     append: `console=${consoleDevice}`,
     machineType: args.machineType,
     accel: args.accel,
@@ -400,6 +437,25 @@ function main() {
   const bridge = new VirtioBridge(args.virtioSocketPath);
   const inflight = new Map<number, WebSocket>();
   const stdinAllowed = new Set<number>();
+
+  const mac = parseMac(args.netMac) ?? Buffer.from([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+  const network = args.netEnabled
+    ? new QemuNetworkBackend({
+        socketPath: args.netSocketPath,
+        vmMac: mac,
+        debug: args.netDebug,
+      })
+    : null;
+
+  if (network) {
+    network.on("log", (message: string) => {
+      process.stdout.write(`${message}\n`);
+    });
+    network.on("error", (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stdout.write(`[net] error ${msg}\n`);
+    });
+  }
 
   let wss: WebSocketServer | null = null;
 
@@ -582,6 +638,10 @@ function main() {
     });
   });
 
+  if (network) {
+    network.start();
+  }
+
   bridge.connect();
   void controller.start();
 
@@ -591,6 +651,7 @@ function main() {
     await controller.stop();
     wss?.close();
     bridge.disconnect();
+    network?.stop();
     process.exit(0);
   };
 

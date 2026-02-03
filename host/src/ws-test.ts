@@ -3,7 +3,9 @@ import { WebSocket } from "ws";
 import { decodeOutputFrame } from "./ws-protocol";
 
 const url = process.env.WS_URL ?? "ws://127.0.0.1:8080";
-const timeoutMs = Number(process.env.WS_TIMEOUT ?? 5000);
+const timeoutMs = Number(process.env.WS_TIMEOUT ?? 15000);
+const httpUrl = process.env.WS_HTTP_URL ?? "http://icanhazip.com";
+const httpsUrl = process.env.WS_HTTPS_URL ?? "https://icanhazip.com";
 
 async function run() {
   const ws = new WebSocket(url);
@@ -23,7 +25,11 @@ async function run() {
           cmd: "python3",
           argv: [
             "-c",
-            "import os,sys; entries=os.listdir('/'); print(sys.version.splitlines()[0]); print('ROOTFS'); print(entries);",
+            `import sys,urllib.request;\n` +
+              `print('HTTP');\n` +
+              `print(urllib.request.urlopen('${httpUrl}', timeout=10).read().decode().strip());\n` +
+              `print('HTTPS');\n` +
+              `print(urllib.request.urlopen('${httpsUrl}', timeout=10).read().decode().strip());\n`,
           ],
         })
       );
@@ -49,17 +55,18 @@ async function run() {
           return;
         }
         const lines = output.trim().split("\n");
-        const versionLine = lines[0] ?? "";
-        if (!/^\d+\.\d+\.\d+/.test(versionLine)) {
+        const httpIndex = lines.findIndex((line) => line.trim() === "HTTP");
+        const httpsIndex = lines.findIndex((line) => line.trim() === "HTTPS");
+        if (httpIndex === -1 || httpsIndex === -1) {
           const detail = stderr.trim() ? `\n${stderr.trim()}` : "";
-          reject(new Error(`unexpected output: ${output.trim()}${detail}`));
+          reject(new Error(`missing http/https output: ${output.trim()}${detail}`));
           return;
         }
-        const rootfsIndex = lines.findIndex((line) => line.trim() === "ROOTFS");
-        const rootfsListing = lines.slice(rootfsIndex + 1).filter((line) => line.trim().length > 0);
-        if (rootfsIndex === -1 || rootfsListing.length === 0) {
+        const httpValue = lines[httpIndex + 1]?.trim();
+        const httpsValue = lines[httpsIndex + 1]?.trim();
+        if (!httpValue || !httpsValue) {
           const detail = stderr.trim() ? `\n${stderr.trim()}` : "";
-          reject(new Error(`missing rootfs output: ${output.trim()}${detail}`));
+          reject(new Error(`empty http/https response: ${output.trim()}${detail}`));
           return;
         }
         resolve();
