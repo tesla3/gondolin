@@ -11,8 +11,19 @@ import {
   TcpPauseMessage,
   TcpResumeMessage,
   TcpSendMessage,
+  TcpFlowProtocol,
   UdpSendMessage,
 } from "./network-stack";
+
+const HOP_BY_HOP_HEADERS = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-connection",
+  "transfer-encoding",
+  "te",
+  "trailer",
+  "upgrade",
+]);
 
 type UdpSession = {
   socket: dgram.Socket;
@@ -22,13 +33,54 @@ type UdpSession = {
   dstPort: number;
 };
 
+type HttpRequestData = {
+  method: string;
+  target: string;
+  version: string;
+  headers: Record<string, string>;
+  body: Buffer;
+};
+
+type HttpSession = {
+  buffer: Buffer;
+  processing: boolean;
+  closed: boolean;
+};
+
 type TcpSession = {
-  socket: net.Socket;
+  socket: net.Socket | null;
   srcIP: string;
   srcPort: number;
   dstIP: string;
   dstPort: number;
+  connectIP: string;
   flowControlPaused: boolean;
+  protocol: TcpFlowProtocol | null;
+  connected: boolean;
+  pendingWrites: Buffer[];
+  http?: HttpSession;
+};
+
+export type HttpHookRequest = {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body: Buffer | null;
+};
+
+export type HttpHookResponse = {
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  body: Buffer;
+};
+
+export type HttpHooks = {
+  onRequest?: (request: HttpHookRequest) => Promise<HttpHookRequest | void> | HttpHookRequest | void;
+  onResponse?: (
+    response: HttpHookResponse,
+    request: HttpHookRequest
+  ) => Promise<HttpHookResponse | void> | HttpHookResponse | void;
 };
 
 export type QemuNetworkOptions = {
@@ -38,6 +90,7 @@ export type QemuNetworkOptions = {
   gatewayMac?: Buffer;
   vmMac?: Buffer;
   debug?: boolean;
+  httpHooks?: HttpHooks;
 };
 
 export class QemuNetworkBackend extends EventEmitter {
@@ -126,6 +179,20 @@ export class QemuNetworkBackend extends EventEmitter {
         onTcpPause: (message) => this.handleTcpPause(message),
         onTcpResume: (message) => this.handleTcpResume(message),
       },
+      allowTcpFlow: (info) => {
+        const session = this.tcpSessions.get(info.key);
+        if (session) {
+          session.protocol = info.protocol;
+          if (info.protocol === "http") {
+            session.http = session.http ?? {
+              buffer: Buffer.alloc(0),
+              processing: false,
+              closed: false,
+            };
+          }
+        }
+        return true;
+      },
     });
 
     this.stack.on("network-activity", () => this.flush());
@@ -165,7 +232,7 @@ export class QemuNetworkBackend extends EventEmitter {
 
     for (const session of this.tcpSessions.values()) {
       try {
-        session.socket.destroy();
+        session.socket?.destroy();
       } catch {
         // ignore
       }
@@ -215,64 +282,60 @@ export class QemuNetworkBackend extends EventEmitter {
     const connectIP =
       message.dstIP === (this.options.gatewayIP ?? "192.168.127.1") ? "127.0.0.1" : message.dstIP;
 
-    const socket = new net.Socket();
     const session: TcpSession = {
-      socket,
+      socket: null,
       srcIP: message.srcIP,
       srcPort: message.srcPort,
       dstIP: message.dstIP,
       dstPort: message.dstPort,
+      connectIP,
       flowControlPaused: false,
+      protocol: null,
+      connected: false,
+      pendingWrites: [],
     };
     this.tcpSessions.set(message.key, session);
 
-    socket.connect(message.dstPort, connectIP, () => {
-      this.stack?.handleTcpConnected({ key: message.key });
-      this.flush();
-    });
-
-    socket.on("data", (data) => {
-      this.stack?.handleTcpData({ key: message.key, data: Buffer.from(data) });
-      this.flush();
-    });
-
-    socket.on("end", () => {
-      this.stack?.handleTcpEnd({ key: message.key });
-      this.flush();
-    });
-
-    socket.on("close", () => {
-      this.stack?.handleTcpClosed({ key: message.key });
-      this.tcpSessions.delete(message.key);
-    });
-
-    socket.on("error", () => {
-      this.stack?.handleTcpError({ key: message.key });
-      this.tcpSessions.delete(message.key);
-    });
+    this.stack?.handleTcpConnected({ key: message.key });
+    this.flush();
   }
 
   private handleTcpSend(message: TcpSendMessage) {
     const session = this.tcpSessions.get(message.key);
-    if (session && session.socket.writable) {
+    if (!session) return;
+
+    if (session.protocol === "http") {
+      this.handleHttpData(message.key, session, message.data);
+      return;
+    }
+
+    this.ensureTcpSocket(message.key, session);
+    if (session.socket && session.connected && session.socket.writable) {
       session.socket.write(message.data);
+    } else {
+      session.pendingWrites.push(message.data);
     }
   }
 
   private handleTcpClose(message: TcpCloseMessage) {
     const session = this.tcpSessions.get(message.key);
     if (session) {
-      if (message.destroy) {
-        session.socket.destroy();
+      session.http = undefined;
+      if (session.socket) {
+        if (message.destroy) {
+          session.socket.destroy();
+        } else {
+          session.socket.end();
+        }
       } else {
-        session.socket.end();
+        this.tcpSessions.delete(message.key);
       }
     }
   }
 
   private handleTcpPause(message: TcpPauseMessage) {
     const session = this.tcpSessions.get(message.key);
-    if (session) {
+    if (session && session.socket) {
       session.flowControlPaused = true;
       session.socket.pause();
     }
@@ -280,9 +343,276 @@ export class QemuNetworkBackend extends EventEmitter {
 
   private handleTcpResume(message: TcpResumeMessage) {
     const session = this.tcpSessions.get(message.key);
-    if (session) {
+    if (session && session.socket) {
       session.flowControlPaused = false;
       session.socket.resume();
     }
+  }
+
+  private ensureTcpSocket(key: string, session: TcpSession) {
+    if (session.socket) return;
+
+    const socket = new net.Socket();
+    session.socket = socket;
+
+    socket.connect(session.dstPort, session.connectIP, () => {
+      session.connected = true;
+      for (const pending of session.pendingWrites) {
+        socket.write(pending);
+      }
+      session.pendingWrites = [];
+    });
+
+    socket.on("data", (data) => {
+      this.stack?.handleTcpData({ key, data: Buffer.from(data) });
+      this.flush();
+    });
+
+    socket.on("end", () => {
+      this.stack?.handleTcpEnd({ key });
+      this.flush();
+    });
+
+    socket.on("close", () => {
+      this.stack?.handleTcpClosed({ key });
+      this.tcpSessions.delete(key);
+    });
+
+    socket.on("error", () => {
+      this.stack?.handleTcpError({ key });
+      this.tcpSessions.delete(key);
+    });
+  }
+
+  private async handleHttpData(key: string, session: TcpSession, data: Buffer) {
+    const httpSession = session.http ?? {
+      buffer: Buffer.alloc(0),
+      processing: false,
+      closed: false,
+    };
+    session.http = httpSession;
+
+    if (httpSession.closed) return;
+
+    httpSession.buffer = Buffer.concat([httpSession.buffer, data]);
+    if (httpSession.processing) return;
+
+    const parsed = this.parseHttpRequest(httpSession.buffer);
+    if (!parsed) return;
+
+    httpSession.processing = true;
+    httpSession.buffer = parsed.remaining;
+
+    try {
+      await this.fetchAndRespond(key, parsed.request);
+    } catch (err) {
+      this.emit("error", err instanceof Error ? err : new Error(String(err)));
+      this.respondWithError(key, 502, "Bad Gateway");
+    } finally {
+      httpSession.closed = true;
+      this.stack?.handleTcpEnd({ key });
+      this.flush();
+    }
+  }
+
+  private parseHttpRequest(buffer: Buffer): { request: HttpRequestData; remaining: Buffer } | null {
+    const headerEnd = buffer.indexOf("\r\n\r\n");
+    if (headerEnd === -1) return null;
+
+    const headerBlock = buffer.subarray(0, headerEnd).toString("utf8");
+    const lines = headerBlock.split("\r\n");
+    if (lines.length === 0) return null;
+
+    const [method, target, version] = lines[0].split(" ");
+    if (!method || !target || !version) return null;
+
+    const headers: Record<string, string> = {};
+    for (let i = 1; i < lines.length; i += 1) {
+      const line = lines[i];
+      const idx = line.indexOf(":");
+      if (idx === -1) continue;
+      const key = line.slice(0, idx).trim().toLowerCase();
+      const value = line.slice(idx + 1).trim();
+      if (!key) continue;
+      if (headers[key]) {
+        headers[key] = `${headers[key]}, ${value}`;
+      } else {
+        headers[key] = value;
+      }
+    }
+
+    const bodyOffset = headerEnd + 4;
+    const bodyBuffer = buffer.subarray(bodyOffset);
+
+    const transferEncoding = headers["transfer-encoding"]?.toLowerCase();
+    if (transferEncoding === "chunked") {
+      const chunked = this.decodeChunkedBody(bodyBuffer);
+      if (!chunked.complete) return null;
+      return {
+        request: {
+          method,
+          target,
+          version,
+          headers,
+          body: chunked.body,
+        },
+        remaining: bodyBuffer.subarray(chunked.bytesConsumed),
+      };
+    }
+
+    const contentLength = headers["content-length"] ? Number(headers["content-length"]) : 0;
+    if (!Number.isFinite(contentLength) || contentLength < 0) return null;
+
+    if (bodyBuffer.length < contentLength) return null;
+
+    return {
+      request: {
+        method,
+        target,
+        version,
+        headers,
+        body: bodyBuffer.subarray(0, contentLength),
+      },
+      remaining: bodyBuffer.subarray(contentLength),
+    };
+  }
+
+  private decodeChunkedBody(buffer: Buffer): { complete: boolean; body: Buffer; bytesConsumed: number } {
+    let offset = 0;
+    const chunks: Buffer[] = [];
+
+    while (true) {
+      const lineEnd = buffer.indexOf("\r\n", offset);
+      if (lineEnd === -1) return { complete: false, body: Buffer.alloc(0), bytesConsumed: 0 };
+
+      const sizeLine = buffer.subarray(offset, lineEnd).toString("ascii").split(";")[0].trim();
+      const size = parseInt(sizeLine, 16);
+      if (!Number.isFinite(size)) return { complete: false, body: Buffer.alloc(0), bytesConsumed: 0 };
+
+      const chunkStart = lineEnd + 2;
+      const chunkEnd = chunkStart + size;
+      if (buffer.length < chunkEnd + 2) return { complete: false, body: Buffer.alloc(0), bytesConsumed: 0 };
+
+      if (size > 0) {
+        chunks.push(buffer.subarray(chunkStart, chunkEnd));
+      }
+
+      if (buffer[chunkEnd] !== 0x0d || buffer[chunkEnd + 1] !== 0x0a) {
+        return { complete: false, body: Buffer.alloc(0), bytesConsumed: 0 };
+      }
+
+      offset = chunkEnd + 2;
+      if (size === 0) {
+        return { complete: true, body: Buffer.concat(chunks), bytesConsumed: offset };
+      }
+    }
+  }
+
+  private async fetchAndRespond(key: string, request: HttpRequestData) {
+    const url = this.buildFetchUrl(request);
+    if (!url) {
+      this.respondWithError(key, 400, "Bad Request");
+      return;
+    }
+
+    if (this.options.debug) {
+      this.emit("log", `[net] http bridge ${request.method} ${url}`);
+    }
+
+    let hookRequest: HttpHookRequest = {
+      method: request.method,
+      url,
+      headers: this.stripHopByHopHeaders(request.headers),
+      body: request.body.length > 0 ? request.body : null,
+    };
+
+    if (this.options.httpHooks?.onRequest) {
+      const updated = await this.options.httpHooks.onRequest(hookRequest);
+      if (updated) hookRequest = updated;
+    }
+
+    const response = await fetch(hookRequest.url, {
+      method: hookRequest.method,
+      headers: hookRequest.headers,
+      body: hookRequest.body ?? undefined,
+    });
+
+    if (this.options.debug) {
+      this.emit("log", `[net] http bridge response ${response.status} ${response.statusText}`);
+    }
+
+    const responseBody = Buffer.from(await response.arrayBuffer());
+    let responseHeaders = this.stripHopByHopHeaders(this.headersToRecord(response.headers));
+    responseHeaders["content-length"] = responseBody.length.toString();
+    responseHeaders["connection"] = "close";
+
+    let hookResponse: HttpHookResponse = {
+      status: response.status,
+      statusText: response.statusText || "OK",
+      headers: responseHeaders,
+      body: responseBody,
+    };
+
+    if (this.options.httpHooks?.onResponse) {
+      const updated = await this.options.httpHooks.onResponse(hookResponse, hookRequest);
+      if (updated) hookResponse = updated;
+    }
+
+    this.sendHttpResponse(key, hookResponse);
+  }
+
+  private sendHttpResponse(key: string, response: HttpHookResponse) {
+    const statusLine = `HTTP/1.1 ${response.status} ${response.statusText}\r\n`;
+    const headers = Object.entries(response.headers)
+      .map(([name, value]) => `${name}: ${value}`)
+      .join("\r\n");
+    const headerBlock = `${statusLine}${headers}\r\n\r\n`;
+
+    this.stack?.handleTcpData({ key, data: Buffer.from(headerBlock) });
+    if (response.body.length > 0) {
+      this.stack?.handleTcpData({ key, data: response.body });
+    }
+    this.flush();
+  }
+
+  private respondWithError(key: string, status: number, statusText: string) {
+    const body = Buffer.from(`${status} ${statusText}\n`);
+    this.sendHttpResponse(key, {
+      status,
+      statusText,
+      headers: {
+        "content-length": body.length.toString(),
+        "content-type": "text/plain",
+        connection: "close",
+      },
+      body,
+    });
+  }
+
+  private buildFetchUrl(request: HttpRequestData) {
+    if (request.target.startsWith("http://") || request.target.startsWith("https://")) {
+      return request.target;
+    }
+    const host = request.headers["host"];
+    if (!host) return null;
+    return `http://${host}${request.target}`;
+  }
+
+  private stripHopByHopHeaders(headers: Record<string, string>) {
+    const output: Record<string, string> = {};
+    for (const [name, value] of Object.entries(headers)) {
+      if (!HOP_BY_HOP_HEADERS.has(name.toLowerCase())) {
+        output[name.toLowerCase()] = value;
+      }
+    }
+    return output;
+  }
+
+  private headersToRecord(headers: Headers) {
+    const record: Record<string, string> = {};
+    headers.forEach((value, key) => {
+      record[key.toLowerCase()] = value;
+    });
+    return record;
   }
 }
