@@ -130,7 +130,7 @@ export function resolveSandboxWsServerOptions(
 
   const hostArch = detectHostArch();
   const defaultQemu = hostArch === "arm64" ? "qemu-system-aarch64" : "qemu-system-x86_64";
-  const defaultMemory = hostArch === "arm64" ? "512M" : "256M";
+  const defaultMemory = "1G";
   const debugFlags = parseDebugEnv();
 
   return {

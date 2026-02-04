@@ -795,21 +795,40 @@ export class QemuNetworkBackend extends EventEmitter {
     }
 
     let responseHeaders = this.stripHopByHopHeaders(this.headersToRecord(response.headers));
-    delete responseHeaders["content-encoding"];
-    delete responseHeaders["content-length"];
+    const contentEncoding = responseHeaders["content-encoding"];
+    const contentLength = responseHeaders["content-length"];
+    const parsedLength = contentLength ? Number(contentLength) : null;
+    const hasValidLength =
+      parsedLength !== null && Number.isFinite(parsedLength) && parsedLength >= 0;
+
+    if (contentEncoding) {
+      delete responseHeaders["content-encoding"];
+      delete responseHeaders["content-length"];
+    }
     responseHeaders["connection"] = "close";
 
     const responseBodyStream = response.body;
     const canStream = Boolean(responseBodyStream) && !this.options.httpHooks?.onResponse;
 
     if (canStream && responseBodyStream) {
-      responseHeaders["transfer-encoding"] = "chunked";
-      this.sendHttpResponseHead(write, {
-        status: response.status,
-        statusText: response.statusText || "OK",
-        headers: responseHeaders,
-      });
-      await this.sendChunkedBody(responseBodyStream, write);
+      if (contentEncoding || !hasValidLength) {
+        delete responseHeaders["content-length"];
+        responseHeaders["transfer-encoding"] = "chunked";
+        this.sendHttpResponseHead(write, {
+          status: response.status,
+          statusText: response.statusText || "OK",
+          headers: responseHeaders,
+        });
+        await this.sendChunkedBody(responseBodyStream, write);
+      } else {
+        responseHeaders["content-length"] = parsedLength.toString();
+        this.sendHttpResponseHead(write, {
+          status: response.status,
+          statusText: response.statusText || "OK",
+          headers: responseHeaders,
+        });
+        await this.sendStreamBody(responseBodyStream, write);
+      }
       return;
     }
 
@@ -867,6 +886,20 @@ export class QemuNetworkBackend extends EventEmitter {
     }
 
     write(Buffer.from("0\r\n\r\n"));
+  }
+
+  private async sendStreamBody(body: ReadableStream<Uint8Array>, write: (chunk: Buffer) => void) {
+    const reader = body.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value || value.length === 0) continue;
+        write(Buffer.from(value));
+      }
+    } finally {
+      reader.releaseLock();
+    }
   }
 
   private respondWithError(write: (chunk: Buffer) => void, status: number, statusText: string) {

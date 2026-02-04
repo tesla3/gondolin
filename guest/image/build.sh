@@ -30,7 +30,7 @@ SANDBOXFS_BIN=${SANDBOXFS_BIN:-"${GUEST_DIR}/zig-out/bin/sandboxfs"}
 
 ALPINE_TARBALL="alpine-minirootfs-${ALPINE_VERSION}-${ARCH}.tar.gz"
 ALPINE_URL=${ALPINE_URL:-"https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/releases/${ARCH}/${ALPINE_TARBALL}"}
-EXTRA_PACKAGES=${EXTRA_PACKAGES:-linux-virt rng-tools bash ca-certificates curl nodejs npm uv}
+EXTRA_PACKAGES=${EXTRA_PACKAGES:-linux-virt rng-tools bash ca-certificates curl nodejs npm uv python3}
 
 require_cmd() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -182,6 +182,10 @@ fi
 install -m 0755 "${SANDBOXD_BIN}" "${ROOTFS_DIR}/usr/bin/sandboxd"
 install -m 0755 "${SANDBOXFS_BIN}" "${ROOTFS_DIR}/usr/bin/sandboxfs"
 install -m 0755 "${IMAGE_DIR}/init" "${ROOTFS_DIR}/init"
+
+if [[ -x "${ROOTFS_DIR}/usr/bin/python3" && ! -e "${ROOTFS_DIR}/usr/bin/python" ]]; then
+    ln -s python3 "${ROOTFS_DIR}/usr/bin/python"
+fi
 
 if [[ -n "${MITM_CA_CERT:-}" && -f "${MITM_CA_CERT}" ]]; then
     install -d "${ROOTFS_DIR}/usr/local/share/ca-certificates"
