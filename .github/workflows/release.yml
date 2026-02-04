@@ -26,6 +26,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 lz4
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Build guest binaries
         run: |
@@ -65,6 +67,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-arm lz4
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Build guest binaries (arm64 cross-compile)
         run: |

@@ -62,6 +62,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.qemu }} lz4
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Build guest binaries (cross-compile)
         run: |
@@ -88,7 +90,7 @@ jobs:
 
   test:
     name: Test
-    needs: [check]
+    needs: [check, build-guest]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
