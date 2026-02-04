@@ -41,6 +41,22 @@ async function waitForDataMount(vm: VM) {
   }
 }
 
+async function waitForBindMount(vm: VM, mountPoint: string) {
+  const result = await withTimeout(
+    vm.exec([
+      "sh",
+      "-c",
+      `for i in $(seq 1 50); do grep -q ' ${mountPoint} ' /proc/mounts && exit 0; sleep 0.1; done; exit 1`,
+    ]),
+    timeoutMs
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `bind mount ${mountPoint} not ready (exit ${result.exitCode}): ${result.stderr.toString().trim()}`
+    );
+  }
+}
+
 test("vfs roundtrip between host and guest", { timeout: timeoutMs, skip: Boolean(url) }, async () => {
   const provider = new MemoryProvider();
   const handle = await provider.open("/host.txt", "w+");
@@ -128,4 +144,79 @@ test("vfs hooks can block writes", { timeout: timeoutMs, skip: Boolean(url) }, a
 
   assert.ok(blocked.length > 0);
   assert.ok(blocked.some((entry) => entry.startsWith("/blocked.txt:")));
+});
+
+test("vfs supports read-only email mounts with dynamic content", { timeout: timeoutMs, skip: Boolean(url) }, async () => {
+  const rootProvider = new MemoryProvider();
+  const rootHandle = await rootProvider.open("/root.txt", "w+");
+  await rootHandle.writeFile("root-data");
+  await rootHandle.close();
+
+  const emailProvider = new MemoryProvider();
+  const emailId = "12345";
+  const emailBody = "Subject: Hello\nFrom: test@example.com\n\nHi there!";
+  const apiCalls: string[] = [];
+  const mockApi = {
+    fetchEmail(id: string) {
+      apiCalls.push(id);
+      return id === emailId ? emailBody : "";
+    },
+  };
+
+  await emailProvider.mkdir("/email", { recursive: true });
+  const emailPath = `/email/${emailId}.eml`;
+  const emailHandle = await emailProvider.open(emailPath, "w+");
+  await emailHandle.writeFile(emailBody);
+  await emailHandle.close();
+
+  const emailEntry = (emailProvider as unknown as {
+    _getEntry: (path: string, syscall: string) => { content: Buffer; contentProvider?: () => string };
+  })._getEntry(emailPath, "vfs-test");
+  emailEntry.contentProvider = () => {
+    const payload = mockApi.fetchEmail(emailId);
+    emailEntry.content = Buffer.from(payload);
+    return payload;
+  };
+
+  emailProvider.setReadOnly();
+
+  const vm = new VM({
+    server: { console: "none" },
+    vfs: {
+      mounts: {
+        "/": rootProvider,
+        "/app": emailProvider,
+      },
+    },
+  });
+
+  try {
+    await waitForDataMount(vm);
+    await waitForBindMount(vm, "/app");
+
+    const rootRead = await withTimeout(vm.exec(["sh", "-c", "cat /data/root.txt"]), timeoutMs);
+    if (rootRead.exitCode !== 0) {
+      throw new Error(`cat root failed (exit ${rootRead.exitCode}): ${rootRead.stderr.toString().trim()}`);
+    }
+    assert.equal(rootRead.stdout.toString().trim(), "root-data");
+
+    const emailRead = await withTimeout(
+      vm.exec(["sh", "-c", `cat /app/email/${emailId}.eml`]),
+      timeoutMs
+    );
+    if (emailRead.exitCode !== 0) {
+      throw new Error(`cat email failed (exit ${emailRead.exitCode}): ${emailRead.stderr.toString().trim()}`);
+    }
+    assert.equal(emailRead.stdout.toString().trim(), emailBody);
+
+    const writeAttempt = await withTimeout(
+      vm.exec(["sh", "-c", `echo nope > /app/email/${emailId}-new.eml`]),
+      timeoutMs
+    );
+    assert.notEqual(writeAttempt.exitCode, 0);
+  } finally {
+    await vm.stop();
+  }
+
+  assert.ok(apiCalls.includes(emailId));
 });
