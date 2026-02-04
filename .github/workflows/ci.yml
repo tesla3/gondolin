@@ -104,6 +104,17 @@ jobs:
           node-version: '24'
           cache: 'pnpm'
 
+      - name: Download guest assets
+        uses: actions/download-artifact@v4
+        with:
+          name: gondolin-guest-x64
+          path: .
+
+      - name: Extract guest assets
+        run: |
+          mkdir -p guest/image/out
+          tar -xzvf gondolin-guest-x64.tar.gz -C guest/image/out
+
       - name: Install dependencies
         run: pnpm install
 
