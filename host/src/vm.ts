@@ -23,6 +23,7 @@ import {
   VirtualProvider,
   type VfsHooks,
 } from "./vfs";
+import { loadOrCreateMitmCaSync, resolveMitmCertDir } from "./mitm";
 import { parseDebugEnv } from "./debug";
 import {
   MountRouterProvider,
@@ -191,9 +192,16 @@ export class VM {
       options.token ?? process.env.ELWING_TOKEN ?? process.env.SANDBOX_WS_TOKEN;
     this.autoStart = options.autoStart ?? true;
     this.policy = options.policy ?? null;
-    this.vfs = resolveVmVfs(options.vfs);
+    const mitmMounts = resolveMitmMounts(
+      options.vfs,
+      options.server?.mitmCertDir,
+      options.server?.netEnabled ?? true
+    );
+    const resolvedVfs = resolveVmVfs(options.vfs, mitmMounts);
+    this.vfs = resolvedVfs.provider;
     this.defaultEnv = options.env;
-    const fuseConfig = resolveFuseConfig(options.vfs);
+    let fuseMounts = resolvedVfs.mounts;
+    let fuseConfig = resolveFuseConfig(options.vfs, fuseMounts);
     this.fuseMount = fuseConfig.fuseMount;
     this.fuseBinds = fuseConfig.fuseBinds;
 
@@ -208,7 +216,25 @@ export class VM {
       throw new Error("VM cannot specify both vfs and server.vfsProvider");
     }
     if (serverOptions.vfsProvider) {
-      this.vfs = wrapProvider(serverOptions.vfsProvider, {});
+      const injectedMounts = resolveMitmMounts(
+        undefined,
+        serverOptions.mitmCertDir,
+        serverOptions.netEnabled ?? true
+      );
+      if (Object.keys(injectedMounts).length > 0) {
+        const normalized = normalizeMountMap({
+          "/": serverOptions.vfsProvider,
+          ...injectedMounts,
+        });
+        this.vfs = wrapProvider(new MountRouterProvider(normalized), {});
+        fuseMounts = { "/": serverOptions.vfsProvider, ...injectedMounts };
+      } else {
+        this.vfs = wrapProvider(serverOptions.vfsProvider, {});
+        fuseMounts = { "/": serverOptions.vfsProvider };
+      }
+      fuseConfig = resolveFuseConfig(options.vfs, fuseMounts);
+      this.fuseMount = fuseConfig.fuseMount;
+      this.fuseBinds = fuseConfig.fuseBinds;
       serverOptions.vfsProvider = this.vfs;
     }
     if (options.fetch && serverOptions.fetch === undefined) {
@@ -946,14 +972,32 @@ function normalizeCommand(command: ExecInput, options: ExecOptions): {
   return { cmd: command, argv: options.argv ?? [] };
 }
 
-function resolveVmVfs(options?: VmVfsOptions | null) {
-  if (options === null) return null;
-  const hooks = options?.hooks ?? {};
-  const mounts = options?.mounts ?? {};
-  const mountKeys = Object.keys(mounts);
+type ResolvedVfs = {
+  provider: SandboxVfsProvider | null;
+  mounts: Record<string, VirtualProvider>;
+};
 
+function resolveVmVfs(
+  options?: VmVfsOptions | null,
+  injectedMounts?: Record<string, VirtualProvider>
+): ResolvedVfs {
+  if (options === null) {
+    return { provider: null, mounts: {} };
+  }
+  const hooks = options?.hooks ?? {};
+  const mounts: Record<string, VirtualProvider> = { ...(options?.mounts ?? {}) };
+
+  if (injectedMounts) {
+    for (const [mountPath, provider] of Object.entries(injectedMounts)) {
+      if (!(mountPath in mounts)) {
+        mounts[mountPath] = provider;
+      }
+    }
+  }
+
+  const mountKeys = Object.keys(mounts);
   if (mountKeys.length === 0) {
-    return wrapProvider(new MemoryProvider(), hooks);
+    return { provider: wrapProvider(new MemoryProvider(), hooks), mounts };
   }
 
   const normalized = normalizeMountMap(mounts);
@@ -964,7 +1008,7 @@ function resolveVmVfs(options?: VmVfsOptions | null) {
     provider = new MountRouterProvider(normalized);
   }
 
-  return wrapProvider(provider, hooks);
+  return { provider: wrapProvider(provider, hooks), mounts };
 }
 
 function wrapProvider(provider: VirtualProvider, hooks: VfsHooks) {
@@ -972,11 +1016,46 @@ function wrapProvider(provider: VirtualProvider, hooks: VfsHooks) {
   return new SandboxVfsProvider(provider, hooks);
 }
 
-function resolveFuseConfig(options?: VmVfsOptions | null) {
+function resolveFuseConfig(
+  options?: VmVfsOptions | null,
+  mounts?: Record<string, VirtualProvider>
+) {
   const fuseMount = normalizeMountPath(options?.fuseMount ?? "/data");
-  const mountPaths = listMountPaths(options?.mounts);
+  const mountPaths = listMountPaths(mounts ?? options?.mounts);
   const fuseBinds = mountPaths.filter((mountPath) => mountPath !== "/");
   return { fuseMount, fuseBinds };
+}
+
+function resolveMitmMounts(
+  options?: VmVfsOptions | null,
+  mitmCertDir?: string,
+  netEnabled = true
+): Record<string, VirtualProvider> {
+  if (options === null || !netEnabled) return {};
+
+  const mountPaths = listMountPaths(options?.mounts);
+  if (mountPaths.includes("/etc/ssl/certs")) {
+    return {};
+  }
+
+  return {
+    "/etc/ssl/certs": createMitmCaProvider(mitmCertDir),
+  };
+}
+
+function createMitmCaProvider(mitmCertDir?: string): VirtualProvider {
+  const resolvedDir = resolveMitmCertDir(mitmCertDir);
+  const ca = loadOrCreateMitmCaSync(resolvedDir);
+  const provider = new MemoryProvider();
+  const certPem = ca.certPem.endsWith("\n") ? ca.certPem : `${ca.certPem}\n`;
+  const handle = provider.openSync("/ca-certificates.crt", "w");
+  try {
+    handle.writeFileSync(certPem);
+  } finally {
+    handle.closeSync();
+  }
+  provider.setReadOnly();
+  return provider;
 }
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<Buffer> {

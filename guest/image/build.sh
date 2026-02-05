@@ -230,15 +230,6 @@ if [[ -x "${ROOTFS_DIR}/usr/bin/python3" && ! -e "${ROOTFS_DIR}/usr/bin/python" 
     ln -s python3 "${ROOTFS_DIR}/usr/bin/python"
 fi
 
-if [[ -n "${MITM_CA_CERT:-}" && -f "${MITM_CA_CERT}" ]]; then
-    install -d "${ROOTFS_DIR}/usr/local/share/ca-certificates"
-    install -m 0644 "${MITM_CA_CERT}" "${ROOTFS_DIR}/usr/local/share/ca-certificates/gondolin-mitm-ca.crt"
-
-    if [[ -f "${ROOTFS_DIR}/etc/ssl/certs/ca-certificates.crt" ]]; then
-        cat "${MITM_CA_CERT}" >> "${ROOTFS_DIR}/etc/ssl/certs/ca-certificates.crt"
-    fi
-fi
-
 mkdir -p "${ROOTFS_DIR}/proc" "${ROOTFS_DIR}/sys" "${ROOTFS_DIR}/dev" "${ROOTFS_DIR}/run"
 mkdir -p "${INITRAMFS_DIR}/proc" "${INITRAMFS_DIR}/sys" "${INITRAMFS_DIR}/dev" "${INITRAMFS_DIR}/run"
 

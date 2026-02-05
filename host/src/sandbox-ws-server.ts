@@ -67,6 +67,7 @@ export type SandboxWsServerOptions = {
   policy?: SandboxPolicy;
   fetch?: HttpFetch;
   httpHooks?: HttpHooks;
+  mitmCertDir?: string;
   vfsProvider?: VirtualProvider;
 };
 
@@ -108,6 +109,7 @@ export type ResolvedServerOptions = {
   policy: SandboxPolicy | null;
   fetch?: HttpFetch;
   httpHooks?: HttpHooks;
+  mitmCertDir?: string;
   vfsProvider: VirtualProvider | null;
 };
 
@@ -224,6 +226,7 @@ export function resolveSandboxWsServerOptions(
     policy: options.policy ?? null,
     fetch: options.fetch,
     httpHooks: options.httpHooks,
+    mitmCertDir: options.mitmCertDir,
     vfsProvider: options.vfsProvider ?? null,
   };
 }
@@ -647,6 +650,7 @@ export class SandboxWsServer extends EventEmitter {
           policy: this.policy ?? undefined,
           fetch: this.options.fetch,
           httpHooks: this.options.httpHooks,
+          mitmCertDir: this.options.mitmCertDir,
         })
       : null;
 

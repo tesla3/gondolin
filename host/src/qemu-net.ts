@@ -10,6 +10,8 @@ import dns from "dns";
 import { Duplex } from "stream";
 import type { ReadableStream as WebReadableStream } from "stream/web";
 import forge from "node-forge";
+
+import { loadOrCreateMitmCa, resolveMitmCertDir } from "./mitm";
 import { lookup } from "dns/promises";
 import { Agent, fetch as undiciFetch } from "undici";
 
@@ -172,6 +174,7 @@ export class QemuNetworkBackend extends EventEmitter {
   private stack: NetworkStack | null = null;
   private readonly udpSessions = new Map<string, UdpSession>();
   private readonly tcpSessions = new Map<string, TcpSession>();
+  private readonly mitmDir: string;
   private caPromise: Promise<CaCert> | null = null;
   private tlsContexts = new Map<string, tls.SecureContext>();
   private tlsContextPromises = new Map<string, Promise<tls.SecureContext>>();
@@ -180,6 +183,7 @@ export class QemuNetworkBackend extends EventEmitter {
   constructor(private readonly options: QemuNetworkOptions) {
     super();
     this.policy = options.policy ?? null;
+    this.mitmDir = resolveMitmCertDir(options.mitmCertDir);
   }
 
   start() {
@@ -1014,7 +1018,7 @@ export class QemuNetworkBackend extends EventEmitter {
   }
 
   private getMitmDir() {
-    return this.options.mitmCertDir ?? path.join(process.cwd(), "var", "mitm");
+    return this.mitmDir;
   }
 
   private async ensureCaAsync(): Promise<CaCert> {
@@ -1026,63 +1030,12 @@ export class QemuNetworkBackend extends EventEmitter {
 
   private async loadOrCreateCa(): Promise<CaCert> {
     const mitmDir = this.getMitmDir();
-    await fsp.mkdir(mitmDir, { recursive: true });
-
-    const caKeyPath = path.join(mitmDir, "ca.key");
-    const caCertPath = path.join(mitmDir, "ca.crt");
-
-    try {
-      // Try to load existing CA
-      const [keyPem, certPem] = await Promise.all([
-        fsp.readFile(caKeyPath, "utf8"),
-        fsp.readFile(caCertPath, "utf8"),
-      ]);
-      return {
-        key: forge.pki.privateKeyFromPem(keyPem),
-        cert: forge.pki.certificateFromPem(certPem),
-        certPem,
-      };
-    } catch {
-      // Generate new CA
-      const keys = forge.pki.rsa.generateKeyPair(2048);
-      const cert = forge.pki.createCertificate();
-
-      cert.publicKey = keys.publicKey;
-      cert.serialNumber = generateSerialNumber();
-      cert.validity.notBefore = new Date();
-      cert.validity.notAfter = new Date();
-      cert.validity.notAfter.setDate(cert.validity.notBefore.getDate() + 3650);
-
-      const attrs = [{ name: "commonName", value: "gondolin-mitm-ca" }];
-      cert.setSubject(attrs);
-      cert.setIssuer(attrs);
-
-      cert.setExtensions([
-        { name: "basicConstraints", cA: true, critical: true },
-        {
-          name: "keyUsage",
-          keyCertSign: true,
-          cRLSign: true,
-          critical: true,
-        },
-      ]);
-
-      cert.sign(keys.privateKey, forge.md.sha256.create());
-
-      const keyPem = forge.pki.privateKeyToPem(keys.privateKey);
-      const certPem = forge.pki.certificateToPem(cert);
-
-      await Promise.all([
-        fsp.writeFile(caKeyPath, keyPem),
-        fsp.writeFile(caCertPath, certPem),
-      ]);
-
-      if (this.options.debug) {
-        this.emit("log", `[net] generated mitm CA at ${caCertPath}`);
-      }
-
-      return { key: keys.privateKey, cert, certPem };
-    }
+    const ca = await loadOrCreateMitmCa(mitmDir);
+    return {
+      key: ca.key,
+      cert: ca.cert,
+      certPem: ca.certPem,
+    };
   }
 
   private async getTlsContextAsync(servername: string): Promise<tls.SecureContext> {
@@ -1147,8 +1100,9 @@ export class QemuNetworkBackend extends EventEmitter {
 
       cert.publicKey = keys.publicKey;
       cert.serialNumber = generateSerialNumber();
-      cert.validity.notBefore = new Date();
-      cert.validity.notAfter = new Date();
+      const now = new Date(Date.now() - 5 * 60 * 1000);
+      cert.validity.notBefore = now;
+      cert.validity.notAfter = new Date(now);
       cert.validity.notAfter.setDate(cert.validity.notBefore.getDate() + 825);
 
       const safeName = servername.replace(/[\r\n]/g, "");

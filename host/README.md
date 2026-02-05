@@ -60,7 +60,7 @@ const vm = await VM.create({
   httpHooks,
   env,
   vfs: {
-    mounts: { "/": new MemoryProvider() },
+    mounts: { "/workspace": new MemoryProvider() },
   },
 });
 
@@ -70,6 +70,10 @@ console.log(result.stdout);
 
 await vm.close();
 ```
+
+> **Note:** Avoid mounting a `MemoryProvider` at `/` unless you also provide CA
+> certificates; doing so hides `/etc/ssl/certs` and will cause TLS verification
+> failures (e.g. `curl: (60)`).
 
 ## Features
 
