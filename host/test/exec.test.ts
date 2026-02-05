@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import test from "node:test";
 
-import { closeVm, withVm, shouldSkipVmTests } from "./helpers/vm-fixture";
+import { closeVm, withVm, shouldSkipVmTests, scheduleForceExit } from "./helpers/vm-fixture";
 
 const skipVmTests = shouldSkipVmTests();
 const timeoutMs = Number(process.env.WS_TIMEOUT ?? 60000);
@@ -12,7 +12,10 @@ const execVmOptions = {
   env: { BASE_ENV: "base" },
 };
 
-test.after(() => closeVm(execVmKey));
+test.after(async () => {
+  await closeVm(execVmKey);
+  scheduleForceExit();
+});
 
 test("exec merges env inputs", { skip: skipVmTests, timeout: timeoutMs }, async () => {
   await withVm(execVmKey, execVmOptions, async (vm) => {

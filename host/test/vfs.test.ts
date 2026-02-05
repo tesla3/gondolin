@@ -4,7 +4,7 @@ import test from "node:test";
 
 import { MemoryProvider, ReadonlyProvider } from "../src/vfs";
 import { createErrnoError } from "../src/vfs/errors";
-import { closeVm, withVm, shouldSkipVmTests } from "./helpers/vm-fixture";
+import { closeVm, withVm, shouldSkipVmTests, scheduleForceExit } from "./helpers/vm-fixture";
 
 const skipVmTests = shouldSkipVmTests();
 const timeoutMs = Number(process.env.WS_TIMEOUT ?? 60000);
@@ -61,8 +61,11 @@ const fuseVmOptions = {
   },
 };
 
-test.after(() => closeVm(sharedVmKey));
-test.after(() => closeVm(fuseVmKey));
+test.after(async () => {
+  await closeVm(sharedVmKey);
+  await closeVm(fuseVmKey);
+  scheduleForceExit();
+});
 
 async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   let timer: NodeJS.Timeout | null = null;

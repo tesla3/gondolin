@@ -105,20 +105,77 @@ export async function withVm<T>(
   }
 }
 
+/** Try to stop a VM, giving up after {@link ms} milliseconds. */
+async function stopWithTimeout(vm: VM, ms = 5000): Promise<void> {
+  await Promise.race([
+    vm.stop(),
+    new Promise<void>((resolve) => setTimeout(resolve, ms)),
+  ]);
+}
+
 export async function closeVm(key: string): Promise<void> {
   const entry = pool.get(key);
-  if (!entry) {
+  if (entry) {
+    pool.delete(key);
     pending.delete(key);
+    await stopWithTimeout(entry.vm);
     return;
   }
-  pool.delete(key);
+
+  // VM.create() may still be in-flight (e.g. QEMU booting).  Wait briefly for
+  // it to resolve so we can stop the underlying process; otherwise the child
+  // keeps node alive forever.
+  const inflight = pending.get(key);
   pending.delete(key);
-  await entry.vm.stop();
+  if (inflight) {
+    try {
+      const created = await Promise.race([
+        inflight,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
+      ]);
+      if (created) {
+        await stopWithTimeout(created.vm);
+      }
+    } catch {
+      // VM.create() itself failed — nothing to clean up
+    }
+  }
 }
 
 export async function closeAllVms(): Promise<void> {
   const entries = Array.from(pool.values());
+  const inflightEntries = Array.from(pending.values());
   pool.clear();
   pending.clear();
-  await Promise.all(entries.map(({ vm }) => vm.stop()));
+  await Promise.all(entries.map(({ vm }) => stopWithTimeout(vm)));
+  await Promise.all(
+    inflightEntries.map(async (p) => {
+      try {
+        const entry = await Promise.race([
+          p,
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
+        ]);
+        if (entry) await stopWithTimeout(entry.vm);
+      } catch {
+        // ignore
+      }
+    })
+  );
+}
+
+/**
+ * Schedule a hard process.exit() as a safety net.  If vm.stop() fails to
+ * kill the QEMU child, the orphaned process keeps node alive via its stdio
+ * pipes.  Calling process.exit() triggers the "exit" hook in
+ * sandbox-controller which SIGKILLs all tracked children.
+ *
+ * The timer is unref'd so it does not *itself* keep node alive — it only
+ * fires when something else (the QEMU pipe) is holding the event loop open.
+ */
+export function scheduleForceExit(ms = 10000): void {
+  const timer = setTimeout(() => {
+    console.error("[vm-fixture] force-exiting — VM cleanup timed out");
+    process.exit(1);
+  }, ms);
+  timer.unref();
 }
