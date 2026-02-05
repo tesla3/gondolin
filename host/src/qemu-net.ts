@@ -1377,9 +1377,16 @@ type LookupCallback = (
   family?: number
 ) => void;
 
+type LookupFn = (
+  hostname: string,
+  options: dns.LookupOneOptions | dns.LookupAllOptions,
+  callback: (err: NodeJS.ErrnoException | null, address: LookupResult, family?: number) => void
+) => void;
+
 function createLookupGuard(
   info: { hostname: string; port: number; protocol: "http" | "https" },
-  isAllowed: NonNullable<HttpHooks["isAllowed"]>
+  isAllowed: NonNullable<HttpHooks["isAllowed"]>,
+  lookupFn: LookupFn = (dns.lookup as unknown as LookupFn).bind(dns)
 ) {
   return (
     hostname: string,
@@ -1387,7 +1394,7 @@ function createLookupGuard(
     callback: LookupCallback
   ) => {
     const normalizedOptions = normalizeLookupOptions(options);
-    dns.lookup(hostname, normalizedOptions, (err, address, family) => {
+    lookupFn(hostname, normalizedOptions, (err, address, family) => {
       if (err) {
         callback(err, normalizeLookupFailure(normalizedOptions));
         return;
@@ -1531,9 +1538,9 @@ function applyRedirectRequest(
   };
 }
 
+/** @internal */
 // Expose internal helpers for unit tests. Not part of the public API.
 export const __test = {
-  dns,
   createLookupGuard,
   normalizeLookupEntries,
   normalizeLookupOptions,

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import crypto from "node:crypto";
 
 import forge from "node-forge";
 
@@ -10,7 +11,10 @@ import { HttpRequestBlockedError, QemuNetworkBackend, __test } from "../src/qemu
 
 function makeBackend(options?: Partial<ConstructorParameters<typeof QemuNetworkBackend>[0]>) {
   return new QemuNetworkBackend({
-    socketPath: path.join(os.tmpdir(), `gondolin-net-test-${process.pid}.sock`),
+    socketPath: path.join(
+      os.tmpdir(),
+      `gondolin-net-test-${process.pid}-${crypto.randomUUID()}.sock`
+    ),
     ...options,
   });
 }
@@ -210,54 +214,50 @@ test("qemu-net: fetchAndRespond streams chunked body when length unknown/encoded
 });
 
 test("qemu-net: createLookupGuard filters DNS results via isAllowed", async () => {
-  const originalLookup = __test.dns.lookup;
-  try {
-    // Fake DNS returns a private + public address when `all: true`, but only
-    // a private address for the single-result lookup.
-    (__test.dns as any).lookup = (
-      _hostname: string,
-      options: any,
-      cb: (err: any, address: any, family?: number) => void
-    ) => {
-      if (options?.all) {
-        cb(null, [
-          { address: "127.0.0.1", family: 4 },
-          { address: "93.184.216.34", family: 4 },
-        ]);
-        return;
-      }
-      cb(null, "127.0.0.1", 4);
-    };
+  // Fake DNS returns a private + public address when `all: true`, but only
+  // a private address for the single-result lookup.
+  const lookupMock = (
+    _hostname: string,
+    options: any,
+    cb: (err: any, address: any, family?: number) => void
+  ) => {
+    if (options?.all) {
+      cb(null, [
+        { address: "127.0.0.1", family: 4 },
+        { address: "93.184.216.34", family: 4 },
+      ]);
+      return;
+    }
+    cb(null, "127.0.0.1", 4);
+  };
 
-    const isAllowed = async (info: any) => info.ip !== "127.0.0.1";
-    const guarded = __test.createLookupGuard(
-      { hostname: "example.com", port: 443, protocol: "https" },
-      isAllowed
-    );
+  const isAllowed = async (info: any) => info.ip !== "127.0.0.1";
+  const guarded = __test.createLookupGuard(
+    { hostname: "example.com", port: 443, protocol: "https" },
+    isAllowed,
+    lookupMock as any
+  );
 
-    // all:false should fail if the single address is blocked.
-    await assert.rejects(
-      () =>
-        new Promise<void>((resolve, reject) => {
-          guarded("example.com", { family: 4 }, (err) => {
-            if (err) return reject(err);
-            resolve();
-          });
-        }),
-      (err: unknown) => err instanceof HttpRequestBlockedError
-    );
+  // all:false should fail if the single address is blocked.
+  await assert.rejects(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        guarded("example.com", { family: 4 }, (err) => {
+          if (err) return reject(err);
+          resolve();
+        });
+      }),
+    (err: unknown) => err instanceof HttpRequestBlockedError
+  );
 
-    // all:true should return only allowed entries
-    const all = await new Promise<any[]>((resolve, reject) => {
-      guarded("example.com", { all: true }, (err, address) => {
-        if (err) return reject(err);
-        resolve(address as any[]);
-      });
+  // all:true should return only allowed entries
+  const all = await new Promise<any[]>((resolve, reject) => {
+    guarded("example.com", { all: true }, (err, address) => {
+      if (err) return reject(err);
+      resolve(address as any[]);
     });
-    assert.deepEqual(all, [{ address: "93.184.216.34", family: 4 }]);
-  } finally {
-    (__test.dns as any).lookup = originalLookup;
-  }
+  });
+  assert.deepEqual(all, [{ address: "93.184.216.34", family: 4 }]);
 });
 
 test("qemu-net: TLS MITM generates leaf certificates per host", async () => {
