@@ -1,4 +1,6 @@
 import { EventEmitter } from "events";
+import dns from "dns";
+import net from "net";
 
 // Protocol Constants
 const ETH_P_IP = 0x0800;
@@ -39,6 +41,22 @@ const DHCP_OPT_LEASE_TIME = 51;
 const DHCP_OPT_MSG_TYPE = 53;
 const DHCP_OPT_SERVER_ID = 54;
 const DHCP_OPT_END = 255;
+
+function normalizeDnsServers(servers?: string[]): string[] {
+  const candidates = (servers && servers.length > 0 ? servers : dns.getServers())
+    .map((server) => server.split("%")[0])
+    .filter((server) => net.isIP(server) === 4);
+
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const server of candidates) {
+    if (seen.has(server)) continue;
+    seen.add(server);
+    unique.push(server);
+  }
+
+  return unique.length > 0 ? unique : ["8.8.8.8"];
+}
 
 export type UdpSendMessage = {
   key: string;
@@ -116,6 +134,7 @@ export type NetworkStackOptions = {
   vmIP?: string;
   gatewayMac?: Buffer;
   vmMac?: Buffer;
+  dnsServers?: string[];
   callbacks: NetworkCallbacks;
   allowTcpFlow?: (info: TcpFlowInfo) => boolean;
 };
@@ -125,6 +144,7 @@ export class NetworkStack extends EventEmitter {
   vmIP: string;
   gatewayMac: Buffer;
   vmMac: Buffer | null;
+  dnsServers: string[];
 
   private readonly callbacks: NetworkCallbacks;
   private readonly allowTcpFlow: (info: TcpFlowInfo) => boolean;
@@ -148,6 +168,7 @@ export class NetworkStack extends EventEmitter {
       options.gatewayMac ?? Buffer.from([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
     this.vmMac =
       options.vmMac ?? Buffer.from([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    this.dnsServers = normalizeDnsServers(options.dnsServers);
     this.callbacks = options.callbacks;
     this.allowTcpFlow = options.allowTcpFlow ?? (() => true);
   }
@@ -743,12 +764,26 @@ export class NetworkStack extends EventEmitter {
     reply[optOffset++] = gwIPParts[2];
     reply[optOffset++] = gwIPParts[3];
 
+    const dnsServers = this.dnsServers.length > 0 ? this.dnsServers : ["8.8.8.8"];
+    const dnsEntries = dnsServers
+      .map((server) => server.split(".").map(Number))
+      .filter(
+        (parts) =>
+          parts.length === 4 && parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)
+      );
+
+    if (dnsEntries.length === 0) {
+      dnsEntries.push([8, 8, 8, 8]);
+    }
+
     reply[optOffset++] = DHCP_OPT_DNS;
-    reply[optOffset++] = 4;
-    reply[optOffset++] = 8;
-    reply[optOffset++] = 8;
-    reply[optOffset++] = 8;
-    reply[optOffset++] = 8;
+    reply[optOffset++] = dnsEntries.length * 4;
+    for (const parts of dnsEntries) {
+      reply[optOffset++] = parts[0];
+      reply[optOffset++] = parts[1];
+      reply[optOffset++] = parts[2];
+      reply[optOffset++] = parts[3];
+    }
 
     reply[optOffset++] = 28; // DHCP_OPT_BROADCAST
     reply[optOffset++] = 4;
