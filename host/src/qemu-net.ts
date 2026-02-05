@@ -218,7 +218,7 @@ export class QemuNetworkBackend extends EventEmitter {
     this.server.listen(this.options.socketPath);
   }
 
-  stop() {
+  close() {
     this.detachSocket();
     if (this.server) {
       this.server.close();

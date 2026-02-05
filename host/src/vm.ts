@@ -123,7 +123,7 @@ export class VM {
   private connection: SandboxConnection | null = null;
   private connectPromise: Promise<void> | null = null;
   private startPromise: Promise<void> | null = null;
-  private stopPromise: Promise<void> | null = null;
+  private closePromise: Promise<void> | null = null;
   private statusPromise: Promise<SandboxState> | null = null;
   private statusResolve: ((state: SandboxState) => void) | null = null;
   private statusReject: ((error: Error) => void) | null = null;
@@ -293,14 +293,17 @@ export class VM {
     return this.startPromise;
   }
 
-  async stop() {
-    if (this.stopPromise) return this.stopPromise;
+  /**
+   * Close the VM and release associated resources.
+   */
+  async close() {
+    if (this.closePromise) return this.closePromise;
 
-    this.stopPromise = this.stopInternal().finally(() => {
-      this.stopPromise = null;
+    this.closePromise = this.closeInternal().finally(() => {
+      this.closePromise = null;
     });
 
-    return this.stopPromise;
+    return this.closePromise;
   }
 
   async waitForReady(): Promise<void> {
@@ -474,9 +477,9 @@ export class VM {
     await this.ensureRunning();
   }
 
-  private async stopInternal() {
+  private async closeInternal() {
     if (this.server) {
-      await this.server.stop();
+      await this.server.close();
     }
     if (this.vfs) {
       await this.vfs.close();

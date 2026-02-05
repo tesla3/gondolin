@@ -105,10 +105,10 @@ export async function withVm<T>(
   }
 }
 
-/** Try to stop a VM, giving up after {@link ms} milliseconds. */
-async function stopWithTimeout(vm: VM, ms = 5000): Promise<void> {
+/** Try to close a VM, giving up after {@link ms} milliseconds. */
+async function closeWithTimeout(vm: VM, ms = 5000): Promise<void> {
   await Promise.race([
-    vm.stop(),
+    vm.close(),
     new Promise<void>((resolve) => setTimeout(resolve, ms)),
   ]);
 }
@@ -118,12 +118,12 @@ export async function closeVm(key: string): Promise<void> {
   if (entry) {
     pool.delete(key);
     pending.delete(key);
-    await stopWithTimeout(entry.vm);
+    await closeWithTimeout(entry.vm);
     return;
   }
 
   // VM.create() may still be in-flight (e.g. QEMU booting).  Wait briefly for
-  // it to resolve so we can stop the underlying process; otherwise the child
+  // it to resolve so we can close the underlying process; otherwise the child
   // keeps node alive forever.
   const inflight = pending.get(key);
   pending.delete(key);
@@ -134,7 +134,7 @@ export async function closeVm(key: string): Promise<void> {
         new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
       ]);
       if (created) {
-        await stopWithTimeout(created.vm);
+        await closeWithTimeout(created.vm);
       }
     } catch {
       // VM.create() itself failed — nothing to clean up
@@ -147,7 +147,7 @@ export async function closeAllVms(): Promise<void> {
   const inflightEntries = Array.from(pending.values());
   pool.clear();
   pending.clear();
-  await Promise.all(entries.map(({ vm }) => stopWithTimeout(vm)));
+  await Promise.all(entries.map(({ vm }) => closeWithTimeout(vm)));
   await Promise.all(
     inflightEntries.map(async (p) => {
       try {
@@ -155,7 +155,7 @@ export async function closeAllVms(): Promise<void> {
           p,
           new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
         ]);
-        if (entry) await stopWithTimeout(entry.vm);
+        if (entry) await closeWithTimeout(entry.vm);
       } catch {
         // ignore
       }
@@ -164,7 +164,7 @@ export async function closeAllVms(): Promise<void> {
 }
 
 /**
- * Schedule a hard process.exit() as a safety net.  If vm.stop() fails to
+ * Schedule a hard process.exit() as a safety net.  If vm.close() fails to
  * kill the QEMU child, the orphaned process keeps node alive via its stdio
  * pipes.  Calling process.exit() triggers the "exit" hook in
  * sandbox-controller which SIGKILLs all tracked children.

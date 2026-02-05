@@ -638,7 +638,7 @@ export class SandboxServer extends EventEmitter {
   private inflight = new Map<number, SandboxClient>();
   private stdinAllowed = new Set<number>();
   private startPromise: Promise<void> | null = null;
-  private stopPromise: Promise<void> | null = null;
+  private closePromise: Promise<void> | null = null;
   private started = false;
   private qemuLogBuffer = "";
   private status: SandboxState = "stopped";
@@ -989,14 +989,14 @@ export class SandboxServer extends EventEmitter {
     return this.startPromise;
   }
 
-  async stop(): Promise<void> {
-    if (this.stopPromise) return this.stopPromise;
+  async close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
 
-    this.stopPromise = this.stopInternal().finally(() => {
-      this.stopPromise = null;
+    this.closePromise = this.closeInternal().finally(() => {
+      this.closePromise = null;
     });
 
-    return this.stopPromise;
+    return this.closePromise;
   }
 
   private async startInternal(): Promise<void> {
@@ -1008,14 +1008,14 @@ export class SandboxServer extends EventEmitter {
     this.fsBridge.connect();
   }
 
-  private async stopInternal() {
+  private async closeInternal() {
     this.failInflight("server_shutdown", "server is shutting down");
     this.closeAllClients();
-    await this.controller.stop();
+    await this.controller.close();
     this.bridge.disconnect();
     this.fsBridge.disconnect();
     await this.fsService?.close();
-    this.network?.stop();
+    this.network?.close();
     this.started = false;
   }
 
@@ -1079,7 +1079,7 @@ export class SandboxServer extends EventEmitter {
       if (message.action === "restart") {
         void this.controller.restart();
       } else if (message.action === "shutdown") {
-        void this.controller.stop();
+        void this.controller.close();
       }
     } else {
       sendError(client, {

@@ -444,12 +444,12 @@ async function runExecVm(args: ExecArgs) {
       }
     }
 
-    await vm.stop();
+    await vm.close();
     process.exit(exitCode);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     process.stderr.write(`${message}\n`);
-    await vm.stop();
+    await vm.close();
     process.exit(1);
   }
 }
@@ -628,12 +628,12 @@ async function runBash(argv: string[]) {
       process.stderr.write(`process exited due to signal ${result.signal}\n`);
     }
 
-    await vm.stop();
+    await vm.close();
     process.exit(result.exitCode);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     process.stderr.write(`${message}\n`);
-    await vm.stop();
+    await vm.close();
     process.exit(1);
   }
 }

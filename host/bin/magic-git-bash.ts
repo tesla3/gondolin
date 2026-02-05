@@ -359,12 +359,12 @@ async function main() {
     if (result.signal !== undefined) {
       process.stderr.write(`process exited due to signal ${result.signal}\n`);
     }
-    await vm.stop();
+    await vm.close();
     process.exit(result.exitCode);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     process.stderr.write(`${message}\n`);
-    await vm.stop();
+    await vm.close();
     process.exit(1);
   }
 }

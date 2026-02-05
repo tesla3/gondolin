@@ -100,7 +100,7 @@ async function main() {
       await runTest(vm, test.label, payload);
     }
   } finally {
-    await vm.stop();
+    await vm.close();
   }
 }
 

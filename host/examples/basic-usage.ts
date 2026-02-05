@@ -116,7 +116,7 @@ async function main() {
 
     console.log("\n=== All examples completed! ===");
   } finally {
-    await vm.stop();
+    await vm.close();
   }
 }
 

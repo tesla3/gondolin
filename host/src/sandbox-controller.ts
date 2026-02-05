@@ -112,7 +112,7 @@ export class SandboxController extends EventEmitter {
     });
   }
 
-  async stop() {
+  async close() {
     if (!this.child) return;
     const child = this.child;
     this.child = null;
@@ -138,7 +138,7 @@ export class SandboxController extends EventEmitter {
   }
 
   async restart() {
-    await this.stop();
+    await this.close();
     await this.start();
   }
 
