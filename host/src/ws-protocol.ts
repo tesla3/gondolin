@@ -1,3 +1,29 @@
+/**
+ * WebSocket exec protocol.
+ *
+ * Transport:
+ * - Text frames carry JSON control messages typed in this module.
+ * - Binary frames stream stdout/stderr chunks.
+ *
+ * Client → Server:
+ * - exec { type: "exec", id, cmd, argv?, env?, cwd?, stdin?, pty? }
+ * - stdin { type: "stdin", id, data?: base64 string, eof? }
+ * - pty_resize { type: "pty_resize", id, rows, cols }
+ * - lifecycle { type: "lifecycle", action: "restart" | "shutdown" }
+ * - boot { type: "boot", fuseMount?, fuseBinds? }
+ * - policy { type: "policy", policy }
+ *
+ * Server → Client:
+ * - status { type: "status", state: "starting" | "running" | "stopped" }
+ * - exec_response { type: "exec_response", id, exit_code, signal? }
+ * - error { type: "error", id?, code, message }
+ *
+ * Binary output frame:
+ * +---------+-----------+-------------------+
+ * | u8 tag  | u32 id    | data bytes        |
+ * +---------+-----------+-------------------+
+ * tag = 1 stdout, tag = 2 stderr, id big-endian.
+ */
 import type { SandboxPolicy } from "./policy";
 
 export type { SandboxPolicy, SandboxPolicyRule } from "./policy";
