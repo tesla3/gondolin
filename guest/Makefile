@@ -1,4 +1,4 @@
-.PHONY: build build-bins build-inner test clean run assets image image-inner kernel kernel-inner qemu lint typecheck format
+.PHONY: build build-bins build-inner test clean run assets qemu lint typecheck format
 
 RUN_PARALLEL ?= ../scripts/run-parallel
 
@@ -65,7 +65,9 @@ QEMU_SERIAL ?= stdio
 QEMU_WAIT ?= on
 VIRTIO_SOCK ?= $(IMAGE_OUT)/virtio.sock
 
-build: assets
+build:
+	@$(RUN_PARALLEL) -j 1 \
+		"guest:build" "$(MAKE) assets"
 
 build-bins:
 	@$(RUN_PARALLEL) -j 1 \
@@ -82,19 +84,7 @@ assets: $(IMAGE_INITRAMFS) $(IMAGE_ROOTFS) $(KERNEL)
 $(IMAGE_INITRAMFS) $(IMAGE_ROOTFS) $(KERNEL): $(BUILD_DEPS)
 	$(GONDOLIN) build $(GONDOLIN_BUILD_ARGS)
 
-image:
-	@$(RUN_PARALLEL) -j 1 \
-		"guest:image" "$(MAKE) image-inner"
-
-image-inner: $(IMAGE_INITRAMFS) $(IMAGE_ROOTFS)
-
-kernel:
-	@$(RUN_PARALLEL) -j 1 \
-		"guest:kernel" "$(MAKE) kernel-inner"
-
-kernel-inner: $(KERNEL)
-
-qemu: image kernel
+qemu: assets
 	@rm -f $(VIRTIO_SOCK)
 	$(QEMU) $(QEMU_MACHINE) \
 		-nodefaults -no-reboot -m $(QEMU_MEMORY) -smp $(QEMU_SMP) \
@@ -125,4 +115,4 @@ test: assets
 	$(TSX) ../host/bin/guest-tests.ts
 
 clean:
-	rm -rf zig-cache zig-out $(IMAGE_OUT)
+	@rm -rf zig-cache zig-out $(IMAGE_OUT)

@@ -27,9 +27,9 @@ tooling to boot the micro-VM under QEMU.
 |-------|----------------------|
 | `brew install zig lz4 e2fsprogs` | `sudo apt install zig lz4 cpio curl e2fsprogs` |
 
-The `make image`/`make kernel` targets invoke the shared `gondolin build`
-pipeline through the host CLI. Make sure host Node dependencies are installed
-(e.g., `pnpm install` at the repo root or `pnpm -C host install`).
+The `make build` target invokes the shared `gondolin build` pipeline through
+the host CLI. Make sure host Node dependencies are installed (e.g., `pnpm install`
+at the repo root or `pnpm -C host install`).
 
 ## Common tasks
 
@@ -48,11 +48,11 @@ make build-bins
 Build guest assets using a custom build config:
 
 ```sh
-make image GONDOLIN_BUILD_CONFIG=../build-config.json
+make build GONDOLIN_BUILD_CONFIG=../build-config.json
 ```
 
-Both `make image` and `make kernel` invoke the shared `gondolin build` pipeline
-and will produce all assets in `image/out/`.
+`make build` invokes the shared `gondolin build` pipeline and will produce all
+assets in `image/out/`.
 
 Boot the guest under QEMU (builds assets if needed):
 

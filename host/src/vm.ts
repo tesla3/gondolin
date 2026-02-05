@@ -397,6 +397,7 @@ export class VM {
       stdinEnabled,
       encoding: options.encoding,
       signal: options.signal,
+      buffer: options.buffer,
     });
 
     // Setup abort handling
@@ -790,12 +791,12 @@ export class VM {
       const session = this.sessions.get(frame.id);
       if (!session) return;
       if (frame.stream === "stdout") {
-        if (!session.iterating) {
+        if (session.buffer && !session.iterating) {
           session.stdoutChunks.push(frame.data);
         }
         session.stdout.write(frame.data);
       } else {
-        if (!session.iterating) {
+        if (session.buffer && !session.iterating) {
           session.stderrChunks.push(frame.data);
         }
         session.stderr.write(frame.data);

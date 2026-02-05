@@ -334,7 +334,7 @@ When working in the gondolin repository, assets are loaded from
 
 ```bash
 # Build the guest image
-cd guest && make image
+cd guest && make build
 
 # Run development CLI
 pnpm run bash

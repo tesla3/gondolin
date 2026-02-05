@@ -101,6 +101,12 @@ export type ExecOptions = {
   encoding?: BufferEncoding;
   /** Abort signal to cancel the command */
   signal?: AbortSignal;
+  /** 
+   * Buffer stdout/stderr for the result (default: true).
+   * Set to false to disable buffering for large outputs or when only streaming.
+   * When false, result.stdout and result.stderr will be empty strings.
+   */
+  buffer?: boolean;
 };
 
 /**
@@ -119,6 +125,7 @@ export type ExecSession = {
   encoding: BufferEncoding;
   signal?: AbortSignal;
   signalListener?: () => void;
+  buffer: boolean;
   iterating: boolean;
   requestReady: boolean;
   pendingStdin: Array<{ type: "data"; data: Buffer | string } | { type: "eof" }>;
@@ -422,6 +429,7 @@ export function createExecSession(
     stdinEnabled: boolean;
     encoding?: BufferEncoding;
     signal?: AbortSignal;
+    buffer?: boolean;
   }
 ): ExecSession {
   let resolve!: (result: ExecResult) => void;
@@ -443,6 +451,7 @@ export function createExecSession(
     stdinEnabled: options.stdinEnabled,
     encoding: options.encoding ?? DEFAULT_ENCODING,
     signal: options.signal,
+    buffer: options.buffer ?? true,
     iterating: false,
     requestReady: false,
     pendingStdin: [],
