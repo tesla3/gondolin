@@ -186,10 +186,10 @@ function buildQemuArgs(config: SandboxConfig) {
   const machineType = config.machineType ?? selectMachineType(targetArch);
   args.push("-machine", machineType);
 
-  const accel = config.accel ?? selectAccel();
+  const accel = config.accel ?? selectAccel(targetArch);
   if (accel) args.push("-accel", accel);
 
-  const cpu = config.cpu ?? selectCpu();
+  const cpu = config.cpu ?? selectCpu(targetArch);
   if (cpu) args.push("-cpu", cpu);
 
   if (config.console === "none") {
@@ -252,7 +252,18 @@ function selectMachineType(targetArch: string) {
   return "q35";
 }
 
-function selectAccel() {
+function getHostArch(): "arm64" | "x64" {
+  return process.arch === "arm64" ? "arm64" : "x64";
+}
+
+function selectAccel(targetArch: string) {
+  const hostArch = getHostArch();
+
+  // Cross-arch emulation cannot use hardware acceleration.
+  if (targetArch !== hostArch) {
+    return "tcg";
+  }
+
   if (process.platform === "linux") {
     // Check if KVM is actually available (e.g., not in CI without nested virt)
     try {
@@ -262,11 +273,19 @@ function selectAccel() {
       return "tcg";
     }
   }
+
   if (process.platform === "darwin") return "hvf";
   return "tcg";
 }
 
-function selectCpu() {
+function selectCpu(targetArch: string) {
+  const hostArch = getHostArch();
+
+  // "-cpu host" only makes sense when using hardware accel for the same arch.
+  if (targetArch !== hostArch) {
+    return "max";
+  }
+
   if (process.platform === "linux" || process.platform === "darwin") {
     return "host";
   }

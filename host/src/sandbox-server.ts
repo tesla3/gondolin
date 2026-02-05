@@ -31,7 +31,7 @@ import { QemuNetworkBackend, DEFAULT_MAX_HTTP_BODY_BYTES } from "./qemu-net";
 import type { HttpFetch, HttpHooks } from "./qemu-net";
 import { FsRpcService, SandboxVfsProvider, type VirtualProvider } from "./vfs";
 import { parseDebugEnv } from "./debug";
-import { ensureGuestAssets, loadGuestAssets, type GuestAssets } from "./assets";
+import { ensureGuestAssets, loadAssetManifest, loadGuestAssets, type GuestAssets } from "./assets";
 
 /**
  * Path to guest image assets.
@@ -167,6 +167,45 @@ function resolveImagePath(imagePath: ImagePath): GuestAssets {
   return imagePath;
 }
 
+function normalizeArch(value: string | null | undefined): "arm64" | "x64" | null {
+  if (!value) return null;
+  const lower = value.toLowerCase();
+  if (lower === "arm64" || lower === "aarch64") return "arm64";
+  if (lower === "x64" || lower === "x86_64" || lower === "amd64") return "x64";
+  return null;
+}
+
+function detectQemuArch(qemuPath: string): "arm64" | "x64" | null {
+  const lower = qemuPath.toLowerCase();
+  if (lower.includes("aarch64") || lower.includes("arm64")) return "arm64";
+  if (lower.includes("x86_64") || lower.includes("x64") || lower.includes("amd64")) return "x64";
+  return null;
+}
+
+function findCommonAssetDir(assets: Partial<GuestAssets>): string | null {
+  const kernelDir = assets.kernelPath ? path.dirname(assets.kernelPath) : null;
+  const initrdDir = assets.initrdPath ? path.dirname(assets.initrdPath) : null;
+  const rootfsDir = assets.rootfsPath ? path.dirname(assets.rootfsPath) : null;
+
+  if (!kernelDir || !initrdDir || !rootfsDir) return null;
+  if (kernelDir !== initrdDir || kernelDir !== rootfsDir) return null;
+  return kernelDir;
+}
+
+function detectGuestArchFromManifest(assets: Partial<GuestAssets>): {
+  arch: "arm64" | "x64";
+  manifestPath: string;
+} | null {
+  const dir = findCommonAssetDir(assets);
+  if (!dir) return null;
+
+  const manifest = loadAssetManifest(dir);
+  const arch = normalizeArch(manifest?.config?.arch);
+  if (!manifest || !arch) return null;
+
+  return { arch, manifestPath: path.join(dir, "manifest.json") };
+}
+
 /**
  * Resolve server options synchronously.
  *
@@ -225,8 +264,31 @@ export function resolveSandboxServerOptions(
     );
   }
 
+  const qemuPath = options.qemuPath ?? defaultQemu;
+
+  // Fail fast if we can detect that the guest image doesn't match the QEMU target.
+  // Without this, the VM often just "hangs" until some higher-level timeout.
+  const guestFromManifest = detectGuestArchFromManifest({
+    kernelPath,
+    initrdPath,
+    rootfsPath,
+  });
+  const qemuArch = detectQemuArch(qemuPath);
+
+  if (guestFromManifest && qemuArch && guestFromManifest.arch !== qemuArch) {
+    const host = normalizeArch(hostArch) ?? hostArch;
+    throw new Error(
+      "Guest image architecture mismatch.\n" +
+        `  guest assets: ${guestFromManifest.arch} (from ${guestFromManifest.manifestPath})\n` +
+        `  qemu binary:  ${qemuArch} (${qemuPath})\n` +
+        `  host arch:    ${host}\n\n` +
+        "Fix: use a matching qemuPath (e.g. qemu-system-aarch64 vs qemu-system-x86_64) " +
+        "or rebuild/download guest assets for the correct architecture."
+    );
+  }
+
   return {
-    qemuPath: options.qemuPath ?? defaultQemu,
+    qemuPath,
     kernelPath,
     initrdPath,
     rootfsPath,
