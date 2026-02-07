@@ -72,19 +72,12 @@ QEMU and Node installed:
 
 ## Documentation
 
-Documentation: [earendil-works.github.io/gondolin](https://earendil-works.github.io/gondolin/)
-
-Guides:
+- [Introduction](https://earendil-works.github.io/gondolin/)
 - [CLI](https://earendil-works.github.io/gondolin/cli/)
-- [SDK (TypeScript)](https://earendil-works.github.io/gondolin/sdk/)
+- [TypeScript SDK](https://earendil-works.github.io/gondolin/sdk/)
 - [SSH](https://earendil-works.github.io/gondolin/ssh/)
-- [Debug logging](https://earendil-works.github.io/gondolin/debug/)
-- [Custom images](https://earendil-works.github.io/gondolin/custom-images/)
-
-Architecture:
-- [Security design](https://earendil-works.github.io/gondolin/security/)
-- [Network stack](https://earendil-works.github.io/gondolin/network/)
-- [QEMU](https://earendil-works.github.io/gondolin/qemu/)
+- [Custom Images](https://earendil-works.github.io/gondolin/custom-images/)
+- [Architecture Overview](https://earendil-works.github.io/gondolin/architecture/)
 
 ## Why Gondolin?
 
@@ -157,7 +150,7 @@ const vm = await VM.create({
 });
 ```
 
-See the [SDK (TypeScript) reference](https://earendil-works.github.io/gondolin/sdk/) for full API details.
+See the [SDK reference](https://earendil-works.github.io/gondolin/sdk/) for full API details.
 
 ## Custom Images
 
