@@ -721,7 +721,7 @@ function findMke2fs(): string {
   throw new Error(
     "Missing required command: mke2fs (install e2fsprogs)\n" +
       "On macOS: brew install e2fsprogs\n" +
-      'Then add to PATH: export PATH="/opt/homebrew/opt/e2fsprogs/sbin:/opt/homebrew/opt/e2fsprogs/bin:$PATH"'
+      "Then ensure mke2fs is on your PATH (Homebrew: brew --prefix e2fsprogs)"
   );
 }
 

@@ -74,7 +74,7 @@ fi
 if [[ -z "${MKFS_EXT4:-}" ]]; then
     echo "missing required command: mke2fs (install e2fsprogs)" >&2
     echo "On macOS: brew install e2fsprogs" >&2
-    echo "Then add to PATH: export PATH=\"/opt/homebrew/opt/e2fsprogs/sbin:/opt/homebrew/opt/e2fsprogs/bin:\$PATH\"" >&2
+    echo "Then ensure mke2fs is on your PATH (Homebrew: brew --prefix e2fsprogs)" >&2
     exit 1
 fi
 

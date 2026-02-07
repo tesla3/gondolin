@@ -40,10 +40,7 @@ Building custom images requires the following tools:
 brew install zig@0.15 lz4 e2fsprogs
 ```
 
-Note: On macOS, you may need to add e2fsprogs to your PATH:
-```bash
-export PATH="/opt/homebrew/opt/e2fsprogs/sbin:/opt/homebrew/opt/e2fsprogs/bin:$PATH"
-```
+The build tries to locate `mke2fs` automatically (including common Homebrew locations). If you still see `mke2fs: command not found`, make sure `mke2fs` is available on your `PATH` (you can check where Homebrew installed it with `brew --prefix e2fsprogs`).
 
 ### Linux (Debian/Ubuntu)
 
@@ -222,11 +219,7 @@ Install e2fsprogs:
 - macOS: `brew install e2fsprogs`
 - Linux: `sudo apt install e2fsprogs`
 
-On macOS, add to PATH:
-
-```bash
-export PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH"
-```
+On macOS, ensure `mke2fs` is on your `PATH` (use `brew --prefix e2fsprogs` to find where it was installed).
 
 ### Build Times Out / VM Doesn't Boot
 
