@@ -67,8 +67,16 @@ features = [
 [project.theme.icon]
 logo = "material/cube-outline"
 
-[project.theme.palette]
-# Force light scheme and use grayscale accents
+[[project.theme.palette]]
+# Light mode
 scheme = "default"
 primary = "grey"
 accent = "grey"
+toggle = { icon = "material/weather-night", name = "Switch to dark mode" }
+
+[[project.theme.palette]]
+# Dark mode
+scheme = "slate"
+primary = "grey"
+accent = "grey"
+toggle = { icon = "material/weather-sunny", name = "Switch to light mode" }

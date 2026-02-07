@@ -145,7 +145,15 @@ Key enforcement points:
 
 2. **UDP is blocked except for DNS**
     - Only UDP destination port `53` is handled; other UDP is blocked.
-    - DNS handling is mode-dependent; by default Gondolin uses **synthetic DNS** (no upstream) to prevent DNS tunneling.
+    - DNS handling is mode-dependent:
+      - `synthetic` (default): no upstream DNS; the host replies with synthetic `A`/`AAAA` answers (prevents using DNS as an egress channel)
+      - `trusted`: the host forwards *valid DNS queries* only to the host's trusted resolvers, and replies to the guest as if the response came from the originally targeted resolver IP
+
+        - Prevents using UDP/53 as arbitrary UDP transport to arbitrary destination IPs
+        - Does **not** prevent classic DNS tunneling to attacker-controlled domains (it still performs real DNS lookups)
+        - Upstream resolvers are currently **IPv4-only** and must be explicitly provided or discoverable on the host
+
+      - `open`: forwards UDP/53 to the destination IP the guest targeted; payloads are not validated as DNS (enables UDP/53 tunneling)
 
 3. **HTTP/HTTPS is bridged by the host**
 

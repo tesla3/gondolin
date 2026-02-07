@@ -110,9 +110,10 @@ In the design of Gondolin we made various architectural choices that require ela
   HTTP requests are implicitly re-encrypted by the host.  While this means that the
   trust store needs to trust the certificate of the host, it also means that the guest
   is well protected against sending bad HTTP request to untrusted destinations.  DNS
-  is passed through, but DNS results are actually not used by the host at all.  The
-  host triggers another resolve from scratch and ensures that blocked IPs cannot be
-  accessed through DNS rebinding.
+  is supported but intentionally constrained (mode-dependent; default is **synthetic**
+  DNS with no upstream to reduce DNS tunneling).  Regardless of the guest-visible DNS
+  behavior, DNS results are not trusted for policy decisions: the host resolves again
+  and ensures that blocked IPs cannot be accessed through DNS rebinding.
 * **Filesystem:** the guest uses the file system from the image, plus a bunch of tmpfs
   mounds for temporary changes.  For persistance node VFS mounts are added through a
   singular FUSE instance.  Bind mounts are used to re-bind that instance to different

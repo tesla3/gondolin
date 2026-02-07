@@ -221,9 +221,15 @@ Notable consequences:
 - HTTP redirects are resolved on the host and hidden from the guest (the guest only
   sees the final response), so redirects cannot escape the allowlist.
 - DNS is available in multiple modes:
-  - `synthetic` (default): no upstream DNS, returns synthetic answers
-  - `trusted`: forwards queries only to trusted host resolvers (prevents using UDP/53 as arbitrary UDP transport to arbitrary destination IPs)
-  - `open`: forwards UDP/53 to the destination IP the guest targeted
+
+    - `synthetic` (default): no upstream DNS, returns synthetic answers
+    - `trusted`: forwards queries only to trusted host resolvers (prevents using
+      UDP/53 as arbitrary UDP transport to arbitrary destination IPs)
+
+      - Note: trusted upstream resolvers are currently **IPv4-only**; if none are configured/found, VM creation fails.
+
+    - `open`: forwards UDP/53 to the destination IP the guest targeted
+
 - Even though the guest does DNS resolutions, they're largely disregarded for
   policy; the host enforces policy against the HTTP `Host` header and does its own
   resolution to prevent DNS rebinding attacks.

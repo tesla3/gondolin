@@ -72,16 +72,70 @@ correctness. The enforcement happens *before* any real host sockets are created.
 
 ## DNS Handling
 
-DNS exists because it is useful for HTTP clients, but it is intentionally constrained:
+DNS exists because it is useful for HTTP clients, but it is intentionally constrained.
+
+### DNS Modes (behavior and effects)
 
 - Only UDP destination port **53** is handled.
+- The guest learns a DNS server via DHCP:
+  - In `synthetic` / `trusted` mode, the DHCP server advertises the **gateway** (`192.168.127.1`) as the resolver (so the host can intercept DNS)
+  - In `open` mode, the DHCP server advertises the host's non-loopback IPv4 resolvers (falling back to `8.8.8.8` if none are suitable)
 - DNS behavior is configurable via a **DNS mode**:
-  - `synthetic` (default): no upstream DNS; the host replies with synthetic answers
-  - `trusted`: the guest may send DNS to any IP, but the host forwards queries only to the host's trusted resolvers (prevents using UDP/53 as arbitrary UDP transport to arbitrary destination IPs)
-  - `open`: DNS is forwarded to the destination IP the guest targeted (UDP/53), which allows DNS-like UDP tunneling
-- There is no goal of being a full-featured recursive resolver (for example,
-  caching is not required for correctness).
-- Note: `trusted` mode does not prevent data exfiltration via *legitimate* DNS queries to attacker-controlled domains (classic DNS tunneling over real DNS semantics); it only restricts where UDP/53 can be sent.
+  - `synthetic` (default)
+    - No upstream DNS; the host replies directly with synthetic answers
+    - Responses are only generated for normal-looking queries, and only for `A` / `AAAA` questions
+    - This prevents using DNS as a network egress channel
+  - `trusted`
+    - The guest may send DNS queries to any destination IP, but the host forwards the query only to the host's trusted resolvers
+    - Non-DNS payloads on UDP/53 are blocked (queries must parse as a standard DNS query)
+    - Trusted upstream resolvers are currently **IPv4-only**; if none are available/configured, Gondolin fails fast
+    - This prevents using UDP/53 as arbitrary UDP transport to arbitrary destination IPs, but it does **not** prevent classic DNS tunneling via real DNS semantics
+  - `open`
+    - UDP/53 is forwarded to the destination IP the guest targeted
+    - Payloads are not validated as DNS, which enables DNS-like UDP tunneling
+
+There is no goal of being a full-featured recursive resolver (for example, caching is not required for correctness).
+
+### DNS Options (CLI and SDK)
+
+**CLI** (`gondolin bash` / `gondolin exec`):
+
+- `--dns MODE`
+  - Sets the DNS mode: `synthetic` (default), `trusted`, or `open`
+- `--dns-trusted-server IP`
+  - Repeatable
+  - Adds a trusted upstream DNS resolver (IPv4) for `--dns trusted`
+
+**SDK** (`VM.create`):
+
+```ts
+import { VM } from "@earendil-works/gondolin";
+
+const vm = await VM.create({
+  dns: {
+    mode: "synthetic", // "synthetic" | "trusted" | "open"
+
+    // trustedServers: ["1.1.1.1"],
+
+    // syntheticIPv4: "192.0.2.1",
+    // syntheticIPv6: "2001:db8::1",
+    // syntheticTtlSeconds: 60,
+  },
+});
+```
+
+- `dns.mode`
+  - Selects `synthetic` / `trusted` / `open`
+- `dns.trustedServers`
+  - Upstream resolver IPv4 addresses for `trusted` mode
+  - If omitted, Gondolin uses the host's configured DNS servers filtered to IPv4
+  - In `trusted` mode, having *no* usable IPv4 resolvers is an error
+- `dns.syntheticIPv4` / `dns.syntheticIPv6`
+  - The IP addresses returned in synthetic `A` / `AAAA` answers (synthetic mode only)
+  - Defaults: `192.0.2.1` and `2001:db8::1`
+- `dns.syntheticTtlSeconds`
+  - TTL for synthetic answers in `seconds` (synthetic mode only)
+  - Default: `60`
 
 ### DNS and Policy
 
