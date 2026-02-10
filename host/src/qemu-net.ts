@@ -487,6 +487,8 @@ export type HttpAllowInfo = {
   port: number;
   /** url protocol */
   protocol: "http" | "https";
+  /** the HTTP request that triggered this check */
+  request: HttpHookRequest;
 };
 
 export type DnsMode = "open" | "trusted" | "synthetic";
@@ -2026,7 +2028,7 @@ export class QemuNetworkBackend extends EventEmitter {
         return;
       }
 
-      await this.ensureRequestAllowed(currentUrl, protocol, port);
+      await this.ensureRequestAllowed(currentUrl, protocol, port, currentRequest);
 
       const useDefaultFetch = this.options.fetch === undefined;
       // The custom dispatcher re-checks isAllowed against the resolved IP to
@@ -2036,6 +2038,7 @@ export class QemuNetworkBackend extends EventEmitter {
             hostname: currentUrl.hostname,
             port,
             protocol,
+            request: currentRequest,
           })
         : null;
 
@@ -2390,7 +2393,8 @@ export class QemuNetworkBackend extends EventEmitter {
   private async ensureRequestAllowed(
     parsedUrl: URL,
     protocol: "http" | "https",
-    port: number
+    port: number,
+    request: HttpHookRequest
   ) {
     if (!this.options.httpHooks?.isAllowed) return;
     const { address, family } = await this.resolveHostname(parsedUrl.hostname);
@@ -2400,6 +2404,7 @@ export class QemuNetworkBackend extends EventEmitter {
       family,
       port,
       protocol,
+      request,
     });
     if (!allowed) {
       throw new HttpRequestBlockedError(`blocked by policy: ${parsedUrl.hostname}`);
@@ -2424,6 +2429,7 @@ export class QemuNetworkBackend extends EventEmitter {
     hostname: string;
     port: number;
     protocol: "http" | "https";
+    request: HttpHookRequest;
   }): Agent | null {
     const isAllowed = this.options.httpHooks?.isAllowed;
     if (!isAllowed) return null;
@@ -2664,7 +2670,7 @@ type LookupFn = (
 ) => void;
 
 function createLookupGuard(
-  info: { hostname: string; port: number; protocol: "http" | "https" },
+  info: { hostname: string; port: number; protocol: "http" | "https"; request: HttpHookRequest },
   isAllowed: NonNullable<HttpHooks["isAllowed"]>,
   lookupFn: LookupFn = (dns.lookup as unknown as LookupFn).bind(dns)
 ) {
@@ -2695,6 +2701,7 @@ function createLookupGuard(
             family: entry.family,
             port: info.port,
             protocol: info.protocol,
+            request: info.request,
           });
           if (allowed) {
             if (!normalizedOptions.all) {

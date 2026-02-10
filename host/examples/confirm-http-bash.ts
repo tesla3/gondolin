@@ -295,7 +295,8 @@ async function main() {
           const target = `${info.protocol.toUpperCase()} ${hostname}:${info.port}`;
           const wc = wildcardFor(hostname);
           const wcLabel = wc ? `${wc}:${info.port}` : null;
-          const message = `Allow request to ${target}?`;
+          const { method, url } = info.request;
+          const message = `Allow ${method} ${url} (${target})?`;
 
           // Prefer a real OS popup if available; otherwise fallback to a terminal prompt.
           if (attach) attach.pause();
