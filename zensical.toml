@@ -35,8 +35,8 @@ nav = [
     {"Using Gondolin" = [
         {"Workloads" = "workloads.md"},
         {"CLI" = "cli.md"},
+        {"SDK" = "sdk.md"},
         {"Listening" = "ingress.md"},
-        {"TypeScript SDK" = "sdk.md"},
         {"Secrets Handling" = "secrets.md"},
         {"SSH" = "ssh.md"},
         {"Debug Logging" = "debug.md"},
@@ -47,7 +47,6 @@ nav = [
         {"Snapshots" = "snapshots.md"},
         {"Custom Images" = "custom-images.md"},
     ]},
-
 
     {"Design & Internals" = [
         {"Architecture Overview" = "architecture.md"},
