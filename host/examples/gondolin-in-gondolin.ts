@@ -25,7 +25,7 @@
  *
  * Optional:
  *   - GONDOLIN_INNER_GUEST_DIR=/path/to/guest/assets
- *     (if omitted, host-side `ensureGuestAssets()` is used)
+ *     (if omitted, reuses GONDOLIN_OUTER_GUEST_DIR for the inner VM)
  *   - GONDOLIN_NESTED_COMMAND='echo hi from inner'
  *     (non-interactive mode; runs this command inside L2)
  */
@@ -33,13 +33,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import {
-  VM,
-  ensureGuestAssets,
-  loadGuestAssets,
-  RealFSProvider,
-  ReadonlyProvider,
-} from "../dist/src/index.js";
+import { VM, loadGuestAssets, RealFSProvider, ReadonlyProvider } from "../dist/src/index.js";
 
 type GuestAssets = {
   kernelPath: string;
@@ -87,15 +81,14 @@ function shQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-async function resolveInnerGuestDir(): Promise<string> {
+function resolveInnerGuestDir(outerGuestDir: string): string {
   const explicit = process.env.GONDOLIN_INNER_GUEST_DIR;
   if (explicit) {
     const loaded = loadGuestAssets(path.resolve(explicit));
     return resolveAssetDir(loaded);
   }
 
-  const ensured = await ensureGuestAssets();
-  return resolveAssetDir(ensured);
+  return outerGuestDir;
 }
 
 function buildInnerRunnerScript() {
@@ -107,7 +100,7 @@ function buildInnerRunnerScript() {
     "    sandbox: {",
     '      imagePath: "/inner-assets",',
     '      accel: "tcg",',
-    "      netEnabled: false,",
+    "      netEnabled: true,",
     "    },",
     '    memory: process.env.INNER_MEMORY || "256M",',
     '    cpus: Number(process.env.INNER_CPUS || "1"),',
@@ -203,7 +196,7 @@ async function main() {
   // Validate outer assets eagerly for clearer startup errors.
   loadGuestAssets(outerGuestDir);
 
-  const innerGuestDir = await resolveInnerGuestDir();
+  const innerGuestDir = resolveInnerGuestDir(outerGuestDir);
 
   const hostPackageDir = path.resolve(__dirname, "..");
   const hostDistEntry = path.join(hostPackageDir, "dist/src/index.js");
@@ -229,7 +222,7 @@ async function main() {
   const outerVm = await VM.create({
     sandbox: {
       imagePath: outerGuestDir,
-      netEnabled: false,
+      netEnabled: true,
     },
     memory: outerMemory,
     cpus: outerCpus,

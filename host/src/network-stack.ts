@@ -156,6 +156,8 @@ type TcpSession = {
   peerWindow: number;
   /** queued host->guest tcp payload not yet emitted as segments */
   pendingOutbound: Buffer;
+  /** FIN pending until outbound payload is drained */
+  endPending: boolean;
   flowProtocol: TcpFlowProtocol | null;
   pendingData: Buffer;
   httpMethod?: string;
@@ -707,8 +709,9 @@ export class NetworkStack extends EventEmitter {
         vmAck: ack,
         mySeq: Math.floor(Math.random() * 0x0fffffff),
         myAck: seq + 1,
-        peerWindow: segment.readUInt16BE(14),
+        peerWindow: window,
         pendingOutbound: Buffer.alloc(0),
+        endPending: false,
         flowProtocol: null,
         pendingData: Buffer.alloc(0),
       };
@@ -1159,7 +1162,7 @@ export class NetworkStack extends EventEmitter {
   }
 
   private drainOutboundTcp(key: string, session: TcpSession) {
-    if (session.pendingOutbound.length === 0) {
+    if (session.pendingOutbound.length === 0 && !session.endPending) {
       this.maybeResumeFlow(key);
       return;
     }
@@ -1192,7 +1195,25 @@ export class NetworkStack extends EventEmitter {
       inFlight += chunk.length;
     }
 
-    if (session.pendingOutbound.length > 0) {
+    if (session.pendingOutbound.length === 0 && session.endPending) {
+      if (inFlight < maxInFlight) {
+        this.sendTCP(
+          session.srcIP,
+          session.srcPort,
+          session.dstIP,
+          session.dstPort,
+          session.mySeq,
+          session.myAck,
+          0x11
+        );
+        session.mySeq++;
+        session.state = "FIN_WAIT";
+        session.endPending = false;
+        inFlight += 1;
+      }
+    }
+
+    if (session.pendingOutbound.length > 0 || session.endPending) {
       this.pauseFlow(key);
     } else {
       this.maybeResumeFlow(key);
@@ -1222,7 +1243,10 @@ export class NetworkStack extends EventEmitter {
 
     const payload = Buffer.from(message.data);
     if (payload.length > 0) {
-      session.pendingOutbound = Buffer.concat([session.pendingOutbound, payload]);
+      session.pendingOutbound =
+        session.pendingOutbound.length === 0
+          ? payload
+          : Buffer.concat([session.pendingOutbound, payload]);
       this.drainOutboundTcp(message.key, session);
     }
 
@@ -1236,17 +1260,8 @@ export class NetworkStack extends EventEmitter {
     const session = this.natTable.get(message.key);
     if (!session) return;
 
-    this.sendTCP(
-      session.srcIP,
-      session.srcPort,
-      session.dstIP,
-      session.dstPort,
-      session.mySeq,
-      session.myAck,
-      0x11
-    );
-    session.mySeq++;
-    session.state = "FIN_WAIT";
+    session.endPending = true;
+    this.drainOutboundTcp(message.key, session);
   }
 
   handleTcpError(message: { key: string }) {

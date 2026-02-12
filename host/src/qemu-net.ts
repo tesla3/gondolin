@@ -2575,6 +2575,7 @@ export class QemuNetworkBackend extends EventEmitter {
         this.stack?.handleTcpEnd({ key });
         this.flush();
       },
+      waitForWritable: () => this.waitForFlowResume(key),
     });
   }
 
@@ -2598,6 +2599,7 @@ export class QemuNetworkBackend extends EventEmitter {
           this.flush();
         });
       },
+      waitForWritable: () => this.waitForFlowResume(key),
     });
   }
 
@@ -2712,7 +2714,12 @@ export class QemuNetworkBackend extends EventEmitter {
     key: string,
     session: TcpSession,
     data: Buffer,
-    options: { scheme: "http" | "https"; write: (chunk: Buffer) => void; finish: () => void }
+    options: {
+      scheme: "http" | "https";
+      write: (chunk: Buffer) => void;
+      finish: () => void;
+      waitForWritable?: () => Promise<void>;
+    }
   ) {
     const httpSession = session.http ?? {
       buffer: new HttpReceiveBuffer(),
@@ -2936,7 +2943,12 @@ export class QemuNetworkBackend extends EventEmitter {
       }
 
       releaseHttpConcurrency = await this.httpConcurrency.acquire();
-      await this.fetchAndRespond(parsed.request, options.scheme, options.write);
+      await this.fetchAndRespond(
+        parsed.request,
+        options.scheme,
+        options.write,
+        options.waitForWritable
+      );
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
 
@@ -3312,7 +3324,8 @@ export class QemuNetworkBackend extends EventEmitter {
   private async fetchAndRespond(
     request: HttpRequestData,
     defaultScheme: "http" | "https",
-    write: (chunk: Buffer) => void
+    write: (chunk: Buffer) => void,
+    waitForWritable?: () => Promise<void>
   ) {
     const httpVersion: "HTTP/1.0" | "HTTP/1.1" =
       request.version === "HTTP/1.0" ? "HTTP/1.0" : "HTTP/1.1";
@@ -3526,7 +3539,7 @@ export class QemuNetworkBackend extends EventEmitter {
                 },
                 httpVersion
               );
-              streamedBytes = await this.sendChunkedBody(responseBodyStream, write);
+              streamedBytes = await this.sendChunkedBody(responseBodyStream, write, waitForWritable);
             } else {
               // HTTP/1.0 does not support Transfer-Encoding: chunked.
               delete responseHeaders["transfer-encoding"];
@@ -3539,7 +3552,7 @@ export class QemuNetworkBackend extends EventEmitter {
                 },
                 httpVersion
               );
-              streamedBytes = await this.sendStreamBody(responseBodyStream, write);
+              streamedBytes = await this.sendStreamBody(responseBodyStream, write, waitForWritable);
             }
           } else {
             responseHeaders["content-length"] = parsedLength!.toString();
@@ -3553,7 +3566,7 @@ export class QemuNetworkBackend extends EventEmitter {
               },
               httpVersion
             );
-            streamedBytes = await this.sendStreamBody(responseBodyStream, write);
+            streamedBytes = await this.sendStreamBody(responseBodyStream, write, waitForWritable);
           }
 
           if (this.options.debug) {
@@ -4183,7 +4196,11 @@ export class QemuNetworkBackend extends EventEmitter {
     }
   }
 
-  private async sendChunkedBody(body: WebReadableStream<Uint8Array>, write: (chunk: Buffer) => void): Promise<number> {
+  private async sendChunkedBody(
+    body: WebReadableStream<Uint8Array>,
+    write: (chunk: Buffer) => void,
+    waitForWritable?: () => Promise<void>
+  ): Promise<number> {
     const reader = body.getReader();
     let total = 0;
     try {
@@ -4196,6 +4213,9 @@ export class QemuNetworkBackend extends EventEmitter {
         write(sizeLine);
         write(Buffer.from(value));
         write(Buffer.from("\r\n"));
+        if (waitForWritable) {
+          await waitForWritable();
+        }
       }
     } finally {
       reader.releaseLock();
@@ -4205,7 +4225,11 @@ export class QemuNetworkBackend extends EventEmitter {
     return total;
   }
 
-  private async sendStreamBody(body: WebReadableStream<Uint8Array>, write: (chunk: Buffer) => void): Promise<number> {
+  private async sendStreamBody(
+    body: WebReadableStream<Uint8Array>,
+    write: (chunk: Buffer) => void,
+    waitForWritable?: () => Promise<void>
+  ): Promise<number> {
     const reader = body.getReader();
     let total = 0;
     try {
@@ -4215,6 +4239,9 @@ export class QemuNetworkBackend extends EventEmitter {
         if (!value || value.length === 0) continue;
         total += value.length;
         write(Buffer.from(value));
+        if (waitForWritable) {
+          await waitForWritable();
+        }
       }
     } finally {
       reader.releaseLock();
