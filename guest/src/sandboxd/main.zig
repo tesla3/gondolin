@@ -8,10 +8,154 @@ const c = @cImport({
 
 const log = std.log.scoped(.sandboxd);
 
+const max_queued_stdin_bytes: usize = 4 * 1024 * 1024;
+
 const Termination = struct {
     exit_code: i32,
     signal: ?i32,
 };
+
+const StdinChunk = struct {
+    data: []u8,
+    eof: bool,
+};
+
+const ExecControlMessage = union(enum) {
+    stdin: StdinChunk,
+    resize: protocol.PtyResize,
+    window: protocol.ExecWindow,
+};
+
+const OwnedExecRequest = struct {
+    id: u32,
+    cmd: []u8,
+    argv: []const []const u8,
+    env: []const []const u8,
+    cwd: ?[]u8,
+    stdin: bool,
+    pty: bool,
+    stdout_window: u32,
+    stderr_window: u32,
+
+    fn deinit(self: *OwnedExecRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.cmd);
+        for (self.argv) |arg| allocator.free(arg);
+        allocator.free(self.argv);
+        for (self.env) |entry| allocator.free(entry);
+        allocator.free(self.env);
+        if (self.cwd) |cwd| allocator.free(cwd);
+    }
+};
+
+const VirtioTx = struct {
+    fd: std.posix.fd_t,
+    mutex: std.Thread.Mutex = .{},
+
+    fn sendPayload(self: *VirtioTx, payload: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try protocol.writeFrame(self.fd, payload);
+    }
+
+    fn sendError(self: *VirtioTx, allocator: std.mem.Allocator, id: u32, code: []const u8, message: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try protocol.sendError(allocator, self.fd, id, code, message);
+    }
+
+    fn sendVfsReady(self: *VirtioTx, allocator: std.mem.Allocator) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try protocol.sendVfsReady(allocator, self.fd);
+    }
+
+    fn sendVfsError(self: *VirtioTx, allocator: std.mem.Allocator, message: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try protocol.sendVfsError(allocator, self.fd, message);
+    }
+};
+
+const ExecSession = struct {
+    allocator: std.mem.Allocator,
+    tx: *VirtioTx,
+    req: OwnedExecRequest,
+    mutex: std.Thread.Mutex = .{},
+    control_cv: std.Thread.Condition = .{},
+    controls: std.ArrayList(ExecControlMessage) = .empty,
+    stdin_queued_bytes: usize = 0,
+    done: bool = false,
+    thread: ?std.Thread = null,
+
+    fn init(allocator: std.mem.Allocator, tx: *VirtioTx, req: OwnedExecRequest) ExecSession {
+        return .{
+            .allocator = allocator,
+            .tx = tx,
+            .req = req,
+            .controls = .empty,
+        };
+    }
+
+    fn deinit(self: *ExecSession) void {
+        for (self.controls.items) |msg| {
+            switch (msg) {
+                .stdin => |chunk| self.allocator.free(chunk.data),
+                else => {},
+            }
+        }
+        self.controls.deinit(self.allocator);
+        self.req.deinit(self.allocator);
+    }
+};
+
+fn cloneExecRequest(allocator: std.mem.Allocator, req: protocol.ExecRequest) !OwnedExecRequest {
+    var argv = try allocator.alloc([]const u8, req.argv.len);
+    var argv_len: usize = 0;
+    errdefer {
+        for (argv[0..argv_len]) |arg| allocator.free(arg);
+        allocator.free(argv);
+    }
+    for (req.argv) |arg| {
+        argv[argv_len] = try allocator.dupe(u8, arg);
+        argv_len += 1;
+    }
+
+    var env = try allocator.alloc([]const u8, req.env.len);
+    var env_len: usize = 0;
+    errdefer {
+        for (env[0..env_len]) |entry| allocator.free(entry);
+        allocator.free(env);
+    }
+    for (req.env) |entry| {
+        env[env_len] = try allocator.dupe(u8, entry);
+        env_len += 1;
+    }
+
+    const cwd = if (req.cwd) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (cwd) |value| allocator.free(value);
+
+    const cmd = try allocator.dupe(u8, req.cmd);
+    errdefer allocator.free(cmd);
+
+    return .{
+        .id = req.id,
+        .cmd = cmd,
+        .argv = argv,
+        .env = env,
+        .cwd = cwd,
+        .stdin = req.stdin,
+        .pty = req.pty,
+        .stdout_window = req.stdout_window,
+        .stderr_window = req.stderr_window,
+    };
+}
+
+fn markSessionDone(session: *ExecSession) void {
+    session.mutex.lock();
+    session.done = true;
+    session.control_cv.broadcast();
+    session.mutex.unlock();
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -24,15 +168,22 @@ pub fn main() !void {
     defer virtio.close();
     const virtio_fd: std.posix.fd_t = virtio.handle;
 
+    var tx = VirtioTx{ .fd = virtio_fd };
+
     log.info("opened virtio port", .{});
 
-    sendVfsStatus(allocator, virtio_fd) catch |err| {
+    sendVfsStatus(allocator, &tx) catch |err| {
         log.err("failed to send vfs status: {s}", .{@errorName(err)});
     };
+
+    var exec_sessions = std.AutoHashMap(u32, *ExecSession).init(allocator);
+    defer cleanupAllExecSessions(allocator, &exec_sessions);
 
     var waiting_for_reconnect = false;
 
     while (true) {
+        cleanupFinishedExecSessions(allocator, &exec_sessions);
+
         const frame = protocol.readFrame(allocator, virtio_fd) catch |err| {
             if (err == error.EndOfStream) {
                 if (!waiting_for_reconnect) {
@@ -54,7 +205,7 @@ pub fn main() !void {
             protocol.ProtocolError.UnexpectedType => null,
             else => {
                 log.err("invalid exec_request: {s}", .{@errorName(err)});
-                _ = protocol.sendError(allocator, virtio_fd, 0, "invalid_request", "invalid exec_request") catch {};
+                _ = tx.sendError(allocator, 0, "invalid_request", "invalid exec_request") catch {};
                 continue;
             },
         };
@@ -66,10 +217,39 @@ pub fn main() !void {
                 allocator.free(req.env);
             }
 
-            handleExec(allocator, virtio_fd, req) catch |err| {
-                log.err("exec handling failed: {s}", .{@errorName(err)});
-                _ = protocol.sendError(allocator, virtio_fd, req.id, "exec_failed", "failed to execute") catch {};
+            startExecSession(&exec_sessions, &tx, req) catch |err| {
+                log.err("exec start failed: {s}", .{@errorName(err)});
+                _ = tx.sendError(allocator, req.id, "exec_failed", "failed to execute") catch {};
             };
+            continue;
+        }
+
+        const routed_input = protocol.decodeRoutedInputMessage(allocator, frame) catch |err| switch (err) {
+            protocol.ProtocolError.UnexpectedType => null,
+            else => {
+                log.err("invalid exec input: {s}", .{@errorName(err)});
+                _ = tx.sendError(allocator, 0, "invalid_request", "invalid exec input") catch {};
+                continue;
+            },
+        };
+
+        if (routed_input) |routed| {
+            if (exec_sessions.get(routed.id)) |session| {
+                enqueueExecInput(session, routed.message) catch |err| switch (err) {
+                    error.StdinBackpressure => {
+                        _ = tx.sendError(allocator, routed.id, "stdin_backpressure", "stdin queue full") catch {};
+                    },
+                    error.StdinChunkTooLarge => {
+                        _ = tx.sendError(allocator, routed.id, "stdin_chunk_too_large", "stdin chunk exceeds queue limit") catch {};
+                    },
+                    else => {
+                        log.err("failed to queue exec input id={}: {s}", .{ routed.id, @errorName(err) });
+                        _ = tx.sendError(allocator, routed.id, "exec_failed", "failed to queue exec input") catch {};
+                    },
+                };
+            } else {
+                _ = tx.sendError(allocator, routed.id, "unknown_id", "request id not found") catch {};
+            }
             continue;
         }
 
@@ -77,15 +257,15 @@ pub fn main() !void {
             protocol.ProtocolError.UnexpectedType => null,
             else => {
                 log.err("invalid file_read_request: {s}", .{@errorName(err)});
-                _ = protocol.sendError(allocator, virtio_fd, 0, "invalid_request", "invalid file_read_request") catch {};
+                _ = tx.sendError(allocator, 0, "invalid_request", "invalid file_read_request") catch {};
                 continue;
             },
         };
 
         if (file_read_req) |req| {
-            handleFileRead(allocator, virtio_fd, req) catch |err| {
+            handleFileRead(allocator, &tx, req) catch |err| {
                 log.err("file read failed: {s}", .{@errorName(err)});
-                _ = protocol.sendError(allocator, virtio_fd, req.id, "file_read_failed", @errorName(err)) catch {};
+                _ = tx.sendError(allocator, req.id, "file_read_failed", @errorName(err)) catch {};
             };
             continue;
         }
@@ -94,15 +274,15 @@ pub fn main() !void {
             protocol.ProtocolError.UnexpectedType => null,
             else => {
                 log.err("invalid file_write_request: {s}", .{@errorName(err)});
-                _ = protocol.sendError(allocator, virtio_fd, 0, "invalid_request", "invalid file_write_request") catch {};
+                _ = tx.sendError(allocator, 0, "invalid_request", "invalid file_write_request") catch {};
                 continue;
             },
         };
 
         if (file_write_req) |req| {
-            handleFileWrite(allocator, virtio_fd, req) catch |err| {
+            handleFileWrite(allocator, virtio_fd, &tx, req) catch |err| {
                 log.err("file write failed: {s}", .{@errorName(err)});
-                _ = protocol.sendError(allocator, virtio_fd, req.id, "file_write_failed", @errorName(err)) catch {};
+                _ = tx.sendError(allocator, req.id, "file_write_failed", @errorName(err)) catch {};
             };
             continue;
         }
@@ -111,33 +291,174 @@ pub fn main() !void {
             protocol.ProtocolError.UnexpectedType => null,
             else => {
                 log.err("invalid file_delete_request: {s}", .{@errorName(err)});
-                _ = protocol.sendError(allocator, virtio_fd, 0, "invalid_request", "invalid file_delete_request") catch {};
+                _ = tx.sendError(allocator, 0, "invalid_request", "invalid file_delete_request") catch {};
                 continue;
             },
         };
 
         if (file_delete_req) |req| {
-            handleFileDelete(allocator, virtio_fd, req) catch |err| {
+            handleFileDelete(allocator, &tx, req) catch |err| {
                 log.err("file delete failed: {s}", .{@errorName(err)});
-                _ = protocol.sendError(allocator, virtio_fd, req.id, "file_delete_failed", @errorName(err)) catch {};
+                _ = tx.sendError(allocator, req.id, "file_delete_failed", @errorName(err)) catch {};
             };
             continue;
         }
 
-        _ = protocol.sendError(allocator, virtio_fd, 0, "invalid_request", "unsupported request type") catch {};
+        _ = tx.sendError(allocator, 0, "invalid_request", "unsupported request type") catch {};
     }
 }
 
-fn sendVfsStatus(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t) !void {
+fn startExecSession(
+    sessions: *std.AutoHashMap(u32, *ExecSession),
+    tx: *VirtioTx,
+    req: protocol.ExecRequest,
+) !void {
+    if (sessions.get(req.id)) |existing| {
+        existing.mutex.lock();
+        const done = existing.done;
+        existing.mutex.unlock();
+
+        if (!done) {
+            return error.DuplicateRequestId;
+        }
+
+        if (existing.thread) |thread| {
+            thread.join();
+            existing.thread = null;
+        }
+        existing.deinit();
+        const sess_alloc = existing.allocator;
+        _ = sessions.remove(req.id);
+        sess_alloc.destroy(existing);
+    }
+
+    const allocator = std.heap.page_allocator;
+    var owned_opt: ?OwnedExecRequest = try cloneExecRequest(allocator, req);
+    errdefer if (owned_opt) |owned| {
+        var temp = owned;
+        temp.deinit(allocator);
+    };
+
+    const session = try allocator.create(ExecSession);
+    errdefer allocator.destroy(session);
+
+    session.* = ExecSession.init(allocator, tx, owned_opt.?);
+    owned_opt = null;
+    errdefer session.deinit();
+
+    try sessions.put(req.id, session);
+    errdefer _ = sessions.remove(req.id);
+
+    const thread = try std.Thread.spawn(.{}, execWorker, .{session});
+    session.thread = thread;
+}
+
+fn enqueueExecInput(session: *ExecSession, input: protocol.InputMessage) !void {
+    session.mutex.lock();
+    defer session.mutex.unlock();
+
+    if (session.done) return;
+
+    switch (input) {
+        .stdin => |chunk| {
+            if (chunk.data.len > max_queued_stdin_bytes) {
+                return error.StdinChunkTooLarge;
+            }
+
+            if (session.stdin_queued_bytes + chunk.data.len > max_queued_stdin_bytes) {
+                return error.StdinBackpressure;
+            }
+
+            const copied = try session.allocator.alloc(u8, chunk.data.len);
+            errdefer session.allocator.free(copied);
+            std.mem.copyForwards(u8, copied, chunk.data);
+            try session.controls.append(session.allocator, .{ .stdin = .{ .data = copied, .eof = chunk.eof } });
+            session.stdin_queued_bytes += copied.len;
+        },
+        .resize => |size| {
+            try session.controls.append(session.allocator, .{ .resize = size });
+        },
+        .window => |window| {
+            try session.controls.append(session.allocator, .{ .window = window });
+        },
+    }
+
+    session.control_cv.signal();
+}
+
+fn cleanupFinishedExecSessions(
+    allocator: std.mem.Allocator,
+    sessions: *std.AutoHashMap(u32, *ExecSession),
+) void {
+    var done_ids = std.ArrayList(u32).empty;
+    defer done_ids.deinit(allocator);
+
+    var it = sessions.iterator();
+    while (it.next()) |entry| {
+        const id = entry.key_ptr.*;
+        const session = entry.value_ptr.*;
+
+        session.mutex.lock();
+        const done = session.done;
+        session.mutex.unlock();
+
+        if (done) {
+            done_ids.append(allocator, id) catch return;
+        }
+    }
+
+    for (done_ids.items) |id| {
+        const session = sessions.get(id) orelse continue;
+        if (session.thread) |thread| {
+            thread.join();
+            session.thread = null;
+        }
+        session.deinit();
+        const sess_alloc = session.allocator;
+        _ = sessions.remove(id);
+        sess_alloc.destroy(session);
+    }
+}
+
+fn cleanupAllExecSessions(
+    allocator: std.mem.Allocator,
+    sessions: *std.AutoHashMap(u32, *ExecSession),
+) void {
+    cleanupFinishedExecSessions(allocator, sessions);
+
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(allocator);
+
+    var it = sessions.iterator();
+    while (it.next()) |entry| {
+        ids.append(allocator, entry.key_ptr.*) catch break;
+    }
+
+    for (ids.items) |id| {
+        const session = sessions.get(id) orelse continue;
+        if (session.thread) |thread| {
+            thread.join();
+            session.thread = null;
+        }
+        session.deinit();
+        const sess_alloc = session.allocator;
+        _ = sessions.remove(id);
+        sess_alloc.destroy(session);
+    }
+
+    sessions.deinit();
+}
+
+fn sendVfsStatus(allocator: std.mem.Allocator, tx: *VirtioTx) !void {
     if (try readVfsErrorMessage(allocator)) |message| {
         defer allocator.free(message);
         const trimmed = std.mem.trim(u8, message, " \r\n\t");
         const detail = if (trimmed.len > 0) trimmed else "vfs mount not ready";
-        try protocol.sendVfsError(allocator, virtio_fd, detail);
+        try tx.sendVfsError(allocator, detail);
         return;
     }
 
-    try protocol.sendVfsReady(allocator, virtio_fd);
+    try tx.sendVfsReady(allocator);
 }
 
 fn readVfsErrorMessage(allocator: std.mem.Allocator) !?[]u8 {
@@ -251,7 +572,7 @@ fn resolveRequestPath(
     return std.fs.path.resolve(allocator, &[_][]const u8{ base, request_path });
 }
 
-fn handleFileRead(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: protocol.FileReadRequest) !void {
+fn handleFileRead(allocator: std.mem.Allocator, tx: *VirtioTx, req: protocol.FileReadRequest) !void {
     const resolved_path = try resolveRequestPath(allocator, req.path, req.cwd);
     defer allocator.free(resolved_path);
 
@@ -268,15 +589,15 @@ fn handleFileRead(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: 
 
         const payload = try protocol.encodeFileReadData(allocator, req.id, buffer[0..n]);
         defer allocator.free(payload);
-        try protocol.writeFrame(virtio_fd, payload);
+        try tx.sendPayload(payload);
     }
 
     const done_payload = try protocol.encodeFileReadDone(allocator, req.id);
     defer allocator.free(done_payload);
-    try protocol.writeFrame(virtio_fd, done_payload);
+    try tx.sendPayload(done_payload);
 }
 
-fn handleFileWrite(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: protocol.FileWriteRequest) !void {
+fn handleFileWrite(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, tx: *VirtioTx, req: protocol.FileWriteRequest) !void {
     const resolved_path = try resolveRequestPath(allocator, req.path, req.cwd);
     defer allocator.free(resolved_path);
 
@@ -296,10 +617,10 @@ fn handleFileWrite(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req:
 
     const done_payload = try protocol.encodeFileWriteDone(allocator, req.id);
     defer allocator.free(done_payload);
-    try protocol.writeFrame(virtio_fd, done_payload);
+    try tx.sendPayload(done_payload);
 }
 
-fn handleFileDelete(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: protocol.FileDeleteRequest) !void {
+fn handleFileDelete(allocator: std.mem.Allocator, tx: *VirtioTx, req: protocol.FileDeleteRequest) !void {
     const resolved_path = try resolveRequestPath(allocator, req.path, req.cwd);
     defer allocator.free(resolved_path);
 
@@ -321,16 +642,27 @@ fn handleFileDelete(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req
 
     const done_payload = try protocol.encodeFileDeleteDone(allocator, req.id);
     defer allocator.free(done_payload);
-    try protocol.writeFrame(virtio_fd, done_payload);
+    try tx.sendPayload(done_payload);
 }
 
-fn handleExec(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: protocol.ExecRequest) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
+fn execWorker(session: *ExecSession) void {
+    runExecSession(session) catch |err| {
+        log.err("exec handling failed id={}: {s}", .{ session.req.id, @errorName(err) });
+        _ = session.tx.sendError(session.allocator, session.req.id, "exec_failed", "failed to execute") catch {};
+    };
+
+    markSessionDone(session);
+}
+
+fn runExecSession(session: *ExecSession) !void {
+    const req = session.req;
+
+    var arena = std.heap.ArenaAllocator.init(session.allocator);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
     const argv = try buildArgv(arena_alloc, req.cmd, req.argv);
-    const envp = try buildEnvp(arena_alloc, allocator, req.env);
+    const envp = try buildEnvp(arena_alloc, session.allocator, req.env);
 
     const use_pty = req.pty;
     const wants_stdin = req.stdin or use_pty;
@@ -431,23 +763,18 @@ fn handleExec(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: prot
         }
     }
 
+    errdefer {
+        if (pid > 0) {
+            _ = std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+            _ = std.posix.waitpid(pid, 0);
+        }
+    }
+
     if (!use_pty) {
         std.posix.close(stdout_pipe.?[1]);
         std.posix.close(stderr_pipe.?[1]);
         if (wants_stdin) std.posix.close(stdin_pipe.?[0]);
     }
-
-    const original_flags = try std.posix.fcntl(virtio_fd, std.posix.F.GETFL, 0);
-    const nonblock_flag_u32: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    const nonblock_flag: usize = @intCast(nonblock_flag_u32);
-    _ = try std.posix.fcntl(virtio_fd, std.posix.F.SETFL, original_flags | nonblock_flag);
-    defer _ = std.posix.fcntl(virtio_fd, std.posix.F.SETFL, original_flags) catch {};
-
-    var writer = protocol.FrameWriter.init(allocator);
-    defer writer.deinit();
-
-    var stdin_reader = protocol.FrameReader.init(allocator);
-    defer stdin_reader.deinit();
 
     var stdout_open = stdout_fd != null;
     var stderr_open = stderr_fd != null;
@@ -464,7 +791,6 @@ fn handleExec(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: prot
 
     var buffer: [8192]u8 = undefined;
 
-    const max_buffered: usize = 256 * 1024;
     const max_total_credit: usize = 16 * 1024 * 1024;
 
     const max_stdout_credit: usize = @min(max_total_credit, @as(usize, @intCast(req.stdout_window)));
@@ -474,35 +800,96 @@ fn handleExec(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: prot
     var stderr_credit: usize = max_stderr_credit;
 
     // Once a pipe has hung up, poll() may keep reporting POLLHUP even if
-    // .events=0. If we're currently not allowed to read (no credits/backpressure),
-    // keep it out of the poll set to avoid a tight wakeup loop.
+    // .events=0. If we're currently not allowed to read (no credits), keep it
+    // out of the poll set to avoid a tight wakeup loop.
     var stdout_hup_seen = false;
     var stderr_hup_seen = false;
 
-    while (true) {
-        if (status != null and !stdout_open and !stderr_open and !writer.hasPending()) break;
+    var local_controls = std.ArrayList(ExecControlMessage).empty;
+    defer {
+        for (local_controls.items) |msg| {
+            switch (msg) {
+                .stdin => |chunk| session.allocator.free(chunk.data),
+                else => {},
+            }
+        }
+        local_controls.deinit(session.allocator);
+    }
 
-        var pollfds: [3]std.posix.pollfd = undefined;
+    while (true) {
+        session.mutex.lock();
+        std.mem.swap(std.ArrayList(ExecControlMessage), &local_controls, &session.controls);
+        session.mutex.unlock();
+
+        for (local_controls.items) |msg| {
+            switch (msg) {
+                .stdin => |data| {
+                    const data_len = data.data.len;
+
+                    if (stdin_fd) |fd| {
+                        if (data_len > 0) {
+                            protocol.writeAll(fd, data.data) catch {
+                                std.posix.close(fd);
+                                stdin_fd = null;
+                                stdin_open = false;
+                            };
+                        }
+                        if (data.eof) {
+                            if (close_stdin_on_eof) {
+                                std.posix.close(fd);
+                                stdin_fd = null;
+                            } else {
+                                const eot: [1]u8 = .{4};
+                                _ = protocol.writeAll(fd, &eot) catch {};
+                            }
+                            stdin_open = false;
+                        }
+                    }
+
+                    session.allocator.free(data.data);
+                    session.mutex.lock();
+                    if (session.stdin_queued_bytes >= data_len) {
+                        session.stdin_queued_bytes -= data_len;
+                    } else {
+                        session.stdin_queued_bytes = 0;
+                    }
+                    session.control_cv.signal();
+                    session.mutex.unlock();
+                },
+                .resize => |size| {
+                    if (pty_master) |fd| {
+                        applyPtyResize(fd, size.rows, size.cols);
+                    }
+                },
+                .window => |win| {
+                    if (win.stdout > 0) {
+                        const add: usize = @intCast(win.stdout);
+                        stdout_credit = @min(max_stdout_credit, stdout_credit + add);
+                    }
+                    if (win.stderr > 0) {
+                        const add: usize = @intCast(win.stderr);
+                        stderr_credit = @min(max_stderr_credit, stderr_credit + add);
+                    }
+                },
+            }
+        }
+        local_controls.clearRetainingCapacity();
+
+        if (status != null and !stdout_open and !stderr_open) break;
+
+        var pollfds: [2]std.posix.pollfd = undefined;
         var nfds: usize = 0;
         var stdout_index: ?usize = null;
         var stderr_index: ?usize = null;
-        var virtio_index: ?usize = null;
 
-        const backpressure = writer.pendingBytes() >= max_buffered;
-        const stdout_can_read = !backpressure and stdout_credit > 0;
-        const stderr_can_read = !backpressure and stderr_credit > 0;
+        const stdout_can_read = stdout_credit > 0;
+        const stderr_can_read = stderr_credit > 0;
 
-        // If the main PID has exited in PTY mode, do not wait for EOF. Instead
-        // drain what is currently buffered (bounded) and then force-close the
-        // PTY master so background jobs cannot keep the session open.
         if (use_pty and pty_master != null and pty_close_deadline_ms != null) {
             const now_ms = std.time.milliTimestamp();
             const deadline_ms = pty_close_deadline_ms.?;
 
-            // Do not close early just because the PTY appears empty: late-arriving
-            // output can show up shortly after process exit under load.
             var should_close = now_ms >= deadline_ms;
-
             if (!should_close) {
                 if (pty_exit_drain_remaining) |rem| {
                     if (rem == 0) should_close = true;
@@ -521,12 +908,6 @@ fn handleExec(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: prot
             }
         }
 
-        // If we've already observed POLLHUP but cannot read right now (no credits
-        // or host-side backpressure), re-check whether the fd is drained.
-        //
-        // We keep hung-up fds out of the poll set in this state to avoid tight
-        // wakeup loops, so we need this periodic check to ensure exec completion
-        // still happens.
         if (stdout_open and stdout_hup_seen and !stdout_can_read) {
             if (stdout_fd) |fd| {
                 if (bytesAvailable(fd)) |avail| {
@@ -576,29 +957,33 @@ fn handleExec(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: prot
             }
         }
 
-        // Always poll for input so we can receive exec_window updates.
-        var virtio_events: i16 = std.posix.POLL.IN;
-        if (writer.hasPending()) virtio_events |= std.posix.POLL.OUT;
-        if (virtio_events != 0) {
-            virtio_index = nfds;
-            pollfds[nfds] = .{ .fd = virtio_fd, .events = virtio_events, .revents = 0 };
-            nfds += 1;
-        }
-
-        if (nfds == 0) {
+        if (nfds > 0) {
+            _ = try std.posix.poll(pollfds[0..nfds], 100);
+        } else {
             if (status == null) {
-                status = std.posix.waitpid(pid, 0).status;
+                const res = std.posix.waitpid(pid, std.posix.W.NOHANG);
+                if (res.pid != 0) {
+                    status = res.status;
+                } else {
+                    // Avoid a tight busy loop when the child stays alive after
+                    // closing stdout/stderr early.
+                    std.posix.nanosleep(0, 1 * std.time.ns_per_ms);
+                }
+            } else {
+                // The child is already dead. If output remains but credits are
+                // exhausted, wait until new control messages arrive.
+                session.mutex.lock();
+                _ = session.control_cv.timedWait(&session.mutex, 10 * std.time.ns_per_ms) catch {};
+                session.mutex.unlock();
             }
             continue;
         }
-
-        _ = try std.posix.poll(pollfds[0..nfds], 100);
 
         if (stdout_index) |sindex| {
             const revents = pollfds[sindex].revents;
             if ((revents & std.posix.POLL.HUP) != 0) stdout_hup_seen = true;
 
-            if (!backpressure and stdout_credit > 0 and (revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
+            if (stdout_credit > 0 and (revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
                 const max_read: usize = @min(buffer.len, stdout_credit);
                 const n = std.posix.read(stdout_fd.?, buffer[0..max_read]) catch |err| blk: {
                     if (use_pty and err == error.InputOutput) {
@@ -624,14 +1009,11 @@ fn handleExec(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: prot
                     }
 
                     stdout_credit -= n;
-                    const payload = try protocol.encodeExecOutput(allocator, req.id, "stdout", buffer[0..n]);
-                    defer allocator.free(payload);
-                    try writer.enqueue(payload);
-                    try writer.flush(virtio_fd);
+                    const payload = try protocol.encodeExecOutput(session.allocator, req.id, "stdout", buffer[0..n]);
+                    defer session.allocator.free(payload);
+                    try session.tx.sendPayload(payload);
                 }
             } else if ((revents & std.posix.POLL.HUP) != 0) {
-                // If we are not allowed to read (no credits / backpressure) we still want to
-                // observe EOF promptly when the pipe is drained.
                 if (stdout_fd) |fd| {
                     if (bytesAvailable(fd)) |avail| {
                         if (avail == 0) {
@@ -655,7 +1037,7 @@ fn handleExec(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: prot
             const revents = pollfds[sindex].revents;
             if ((revents & std.posix.POLL.HUP) != 0) stderr_hup_seen = true;
 
-            if (!backpressure and stderr_credit > 0 and (revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
+            if (stderr_credit > 0 and (revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
                 const max_read: usize = @min(buffer.len, stderr_credit);
                 const n = try std.posix.read(stderr_fd.?, buffer[0..max_read]);
                 if (n == 0) {
@@ -664,10 +1046,9 @@ fn handleExec(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: prot
                     stderr_fd = null;
                 } else {
                     stderr_credit -= n;
-                    const payload = try protocol.encodeExecOutput(allocator, req.id, "stderr", buffer[0..n]);
-                    defer allocator.free(payload);
-                    try writer.enqueue(payload);
-                    try writer.flush(virtio_fd);
+                    const payload = try protocol.encodeExecOutput(session.allocator, req.id, "stderr", buffer[0..n]);
+                    defer session.allocator.free(payload);
+                    try session.tx.sendPayload(payload);
                 }
             } else if ((revents & std.posix.POLL.HUP) != 0) {
                 if (stderr_fd) |fd| {
@@ -682,53 +1063,11 @@ fn handleExec(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: prot
             }
         }
 
-        if (virtio_index) |vindex| {
-            const revents = pollfds[vindex].revents;
-            if ((revents & std.posix.POLL.OUT) != 0) {
-                try writer.flush(virtio_fd);
-            }
-            if ((revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
-                handleVirtioInput(
-                    allocator,
-                    &stdin_reader,
-                    virtio_fd,
-                    &stdin_fd,
-                    &stdin_open,
-                    req.id,
-                    close_stdin_on_eof,
-                    pty_master,
-                    &stdout_credit,
-                    &stderr_credit,
-                    max_stdout_credit,
-                    max_stderr_credit,
-                ) catch |err| {
-                    log.err("virtio input handling failed: {s}", .{@errorName(err)});
-                    if (close_stdin_on_eof and stdin_fd != null) {
-                        std.posix.close(stdin_fd.?);
-                        stdin_fd = null;
-                        stdin_open = false;
-                    }
-                };
-
-                // If we were using a PTY, stdout/stdin share the master fd.
-                if (use_pty and stdin_fd != null and !stdin_open) {
-                    stdin_fd = null;
-                }
-                if (!use_pty and close_stdin_on_eof and stdin_fd != null and !stdin_open) {
-                    stdin_fd = null;
-                }
-            }
-        }
-
         if (status == null) {
             const res = std.posix.waitpid(pid, std.posix.W.NOHANG);
             if (res.pid != 0) {
                 status = res.status;
 
-                // In PTY mode, define exec lifetime by the main exec'd process.
-                // Do not wait for EOF: background processes may keep the slave
-                // open forever. Instead, start a short best-effort drain (bounded)
-                // and then force-close the PTY master.
                 if (use_pty and pty_master != null and pty_close_deadline_ms == null) {
                     pty_close_deadline_ms = std.time.milliTimestamp() + 250;
                     pty_exit_drain_remaining = 64 * 1024;
@@ -746,79 +1085,9 @@ fn handleExec(allocator: std.mem.Allocator, virtio_fd: std.posix.fd_t, req: prot
     }
 
     const term = parseStatus(status.?);
-    const response = try protocol.encodeExecResponse(allocator, req.id, term.exit_code, term.signal);
-    defer allocator.free(response);
-    try writer.enqueue(response);
-    try flushWriter(virtio_fd, &writer);
-}
-
-fn handleVirtioInput(
-    allocator: std.mem.Allocator,
-    reader: *protocol.FrameReader,
-    virtio_fd: std.posix.fd_t,
-    stdin_fd: *?std.posix.fd_t,
-    stdin_open: *bool,
-    expected_id: u32,
-    close_on_eof: bool,
-    pty_master: ?std.posix.fd_t,
-    stdout_credit: *usize,
-    stderr_credit: *usize,
-    max_stdout_credit: usize,
-    max_stderr_credit: usize,
-) !void {
-    while (true) {
-        const frame = reader.readFrame(virtio_fd) catch |err| {
-            if (err == error.EndOfStream) {
-                if (stdin_fd.*) |fd| {
-                    std.posix.close(fd);
-                    stdin_fd.* = null;
-                }
-                stdin_open.* = false;
-                return;
-            }
-            return err;
-        };
-        if (frame == null) break;
-
-        const frame_buf = frame.?;
-        defer allocator.free(frame_buf);
-
-        const message = try protocol.decodeInputMessage(allocator, frame_buf, expected_id);
-        switch (message) {
-            .stdin => |data| {
-                if (stdin_fd.*) |fd| {
-                    if (data.data.len > 0) {
-                        try protocol.writeAll(fd, data.data);
-                    }
-                    if (data.eof) {
-                        if (close_on_eof) {
-                            std.posix.close(fd);
-                            stdin_fd.* = null;
-                        } else {
-                            const eot: [1]u8 = .{4};
-                            _ = protocol.writeAll(fd, &eot) catch {};
-                        }
-                        stdin_open.* = false;
-                    }
-                }
-            },
-            .resize => |size| {
-                if (pty_master) |fd| {
-                    applyPtyResize(fd, size.rows, size.cols);
-                }
-            },
-            .window => |win| {
-                if (win.stdout > 0) {
-                    const add: usize = @intCast(win.stdout);
-                    stdout_credit.* = @min(max_stdout_credit, stdout_credit.* + add);
-                }
-                if (win.stderr > 0) {
-                    const add: usize = @intCast(win.stderr);
-                    stderr_credit.* = @min(max_stderr_credit, stderr_credit.* + add);
-                }
-            },
-        }
-    }
+    const response = try protocol.encodeExecResponse(session.allocator, req.id, term.exit_code, term.signal);
+    defer session.allocator.free(response);
+    try session.tx.sendPayload(response);
 }
 
 fn bytesAvailable(fd: std.posix.fd_t) ?usize {

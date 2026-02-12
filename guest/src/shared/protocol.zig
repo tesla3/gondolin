@@ -119,6 +119,13 @@ pub const InputMessage = union(enum) {
     window: ExecWindow,
 };
 
+pub const RoutedInputMessage = struct {
+    /// correlation id
+    id: u32,
+    /// routed input payload
+    message: InputMessage,
+};
+
 pub const TcpOpen = struct {
     /// stream id
     id: u32,
@@ -326,6 +333,13 @@ pub fn decodeInputMessage(allocator: std.mem.Allocator, frame: []const u8, expec
     const root = try dec.decodeValue();
     defer cbor.freeValue(allocator, root);
     return parseInputMessage(root, expected_id);
+}
+
+pub fn decodeRoutedInputMessage(allocator: std.mem.Allocator, frame: []const u8) !RoutedInputMessage {
+    var dec = cbor.Decoder.init(allocator, frame);
+    const root = try dec.decodeValue();
+    defer cbor.freeValue(allocator, root);
+    return parseRoutedInputMessage(root);
 }
 
 pub fn decodeTcpMessage(allocator: std.mem.Allocator, frame: []const u8) !TcpMessage {
@@ -833,6 +847,26 @@ fn parseInputMessage(root: cbor.Value, expected_id: u32) !InputMessage {
     }
     if (std.mem.eql(u8, msg_type, "exec_window")) {
         return .{ .window = try parseExecWindow(root, expected_id) };
+    }
+
+    return ProtocolError.UnexpectedType;
+}
+
+fn parseRoutedInputMessage(root: cbor.Value) !RoutedInputMessage {
+    const map = try expectMap(root);
+    const msg_type = try expectText(cbor.getMapValue(map, "t") orelse return ProtocolError.MissingField);
+
+    const id_val = cbor.getMapValue(map, "id") orelse return ProtocolError.MissingField;
+    const id = try expectU32(id_val);
+
+    if (std.mem.eql(u8, msg_type, "stdin_data")) {
+        return .{ .id = id, .message = .{ .stdin = try parseStdinData(root, id) } };
+    }
+    if (std.mem.eql(u8, msg_type, "pty_resize")) {
+        return .{ .id = id, .message = .{ .resize = try parsePtyResize(root, id) } };
+    }
+    if (std.mem.eql(u8, msg_type, "exec_window")) {
+        return .{ .id = id, .message = .{ .window = try parseExecWindow(root, id) } };
     }
 
     return ProtocolError.UnexpectedType;

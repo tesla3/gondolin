@@ -154,6 +154,68 @@ test("exec supports readable stdin", { skip: skipVmTests, timeout: timeoutMs }, 
   });
 });
 
+test("exec supports concurrent processes with isolated output", { skip: skipVmTests, timeout: timeoutMs }, async () => {
+  await withVm(execVmKey, execVmOptions, async (vm) => {
+    await vm.start();
+
+    const markerPrefix = `/tmp/gondolin-concurrent-exec-${process.pid}`;
+    const markerA = `${markerPrefix}-a.ready`;
+    const markerB = `${markerPrefix}-b.ready`;
+
+    await vm.exec(["/bin/sh", "-c", `rm -f ${markerA} ${markerB}`]);
+
+    const cmdA = [
+      "set -eu",
+      `echo A > ${markerA}`,
+      "i=0",
+      `while [ ! -f ${markerB} ]; do`,
+      "  i=$((i+1))",
+      "  if [ \"$i\" -gt 200 ]; then",
+      "    echo 'A:timeout waiting for peer' >&2",
+      "    exit 42",
+      "  fi",
+      "  sleep 0.01",
+      "done",
+      "echo 'A:out:ok'",
+      "echo 'A:err:ok' >&2",
+    ].join("\n");
+
+    const cmdB = [
+      "set -eu",
+      `echo B > ${markerB}`,
+      "i=0",
+      `while [ ! -f ${markerA} ]; do`,
+      "  i=$((i+1))",
+      "  if [ \"$i\" -gt 200 ]; then",
+      "    echo 'B:timeout waiting for peer' >&2",
+      "    exit 42",
+      "  fi",
+      "  sleep 0.01",
+      "done",
+      "echo 'B:out:ok'",
+      "echo 'B:err:ok' >&2",
+    ].join("\n");
+
+    const [a, b] = await Promise.all([
+      vm.exec(["/bin/sh", "-c", cmdA]),
+      vm.exec(["/bin/sh", "-c", cmdB]),
+    ]);
+
+    assert.equal(a.exitCode, 0);
+    assert.equal(b.exitCode, 0);
+
+    assert.match(a.stdout, /A:out:ok/);
+    assert.match(a.stderr, /A:err:ok/);
+    assert.doesNotMatch(a.stdout, /B:/);
+    assert.doesNotMatch(a.stderr, /B:/);
+
+    assert.match(b.stdout, /B:out:ok/);
+    assert.match(b.stderr, /B:err:ok/);
+    assert.doesNotMatch(b.stdout, /A:/);
+    assert.doesNotMatch(b.stderr, /A:/);
+  });
+});
+
 test("exec output iterator yields stdout and stderr", { skip: skipVmTests, timeout: timeoutMs }, async () => {
   await withVm(execVmKey, execVmOptions, async (vm) => {
     await vm.start();
