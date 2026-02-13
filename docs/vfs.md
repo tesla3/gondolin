@@ -256,7 +256,7 @@ With `writeMode: "tmpfs"`:
   has created files there)
 - Writes go to an in-memory layer and do not touch the host directory
 
-This is also useful for hiding other large host directories of potential the
+This is also useful for hiding other large host directories of potentially the
 wrong architecture (for example: `.git`, `.venv`, `dist`) while still allowing
 the guest to create its own.
 
@@ -313,11 +313,14 @@ Recommended starting points:
 
 ### Do Not Hide CA Certificates By Accident
 
-Gondolin injects a CA bundle into the guest at `/etc/ssl/certs` unless you mount
-your own provider there.
+Gondolin automatically injects a CA bundle into the guest at `/etc/ssl/certs`
+unless you explicitly mount your own provider at that path. This injection works
+even when you mount a `MemoryProvider` at `/`, because the mount router uses
+longest-prefix matching and the injected `/etc/ssl/certs` mount takes
+precedence.
 
-Avoid mounting a `MemoryProvider` at `/` unless you also provide CA
-certificates, otherwise TLS verification may fail.
+If you do mount your own provider at `/etc/ssl/certs`, you must supply valid CA
+certificates yourself, otherwise TLS verification will fail.
 
 ### Disk Checkpoints Do Not Include VFS Data
 

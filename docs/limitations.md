@@ -16,7 +16,8 @@ See also: [Snapshots](./snapshots.md).
 Tracking issue: [#8](https://github.com/earendil-works/gondolin/issues/8).
 
 **Note:** Some guest paths are tmpfs-backed by design (eg. `/root`, `/tmp`,
-`/var/log`). Writes under those paths are not part of disk checkpoints.
+`/var/tmp`, `/var/cache`, `/var/log`). Writes under those paths are not part of
+disk checkpoints.
 
 ## Adding Extra Packages Requires Building a New Image
 

@@ -11,7 +11,7 @@ This feature is called "ingress" internally. It works by:
    a routing table in `/etc/gondolin/listeners`.
 
 This is intentionally not a generic port forward.  It is designed specifically
-for HTTP services with the intentional to allow the host greater control over
+for HTTP services with the intention to allow the host greater control over
 what the sandbox is exposing.
 
 ## CLI Usage

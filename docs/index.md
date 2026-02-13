@@ -4,7 +4,7 @@ AI agents are generating code that runs immediately and increasingly without
 human review.  That code often calls external APIs, which means it needs
 credentials and network access.  Sandboxing the compute isn't enough as you need
 to control network egress and protect secrets from exfiltration.  You also
-want to be able to tighly control the file system, for convenience of the agent
+want to be able to tightly control the file system, for convenience of the agent
 and to control persistence.
 
 Gondolin gives you that.  Lightweight QEMU micro-VMs boot in under a second on
@@ -18,7 +18,7 @@ to use it.
 
 A little appetizer:
 
-```ts
+```bash
 npx @earendil-works/gondolin bash
 ```
 

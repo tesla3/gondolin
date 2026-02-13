@@ -24,7 +24,7 @@ gondolin bash
 ### Requirements
 
 - QEMU installed (`brew install qemu` on macOS, `apt install qemu-system-*` on Linux)
-- Node.js >= 22
+- Node.js >= 18
 
 Guest assets (kernel/initramfs/rootfs, ~200MB) are downloaded automatically on
 first use and cached in `~/.cache/gondolin/`.  Alternative you can [build and
@@ -81,6 +81,21 @@ inside the VM.
   - Affects both:
     - egress (guest -> upstream)
     - ingress (host -> guest) when using `gondolin bash --listen`
+
+### DNS Options
+
+- `--dns MODE`
+  - DNS resolution mode: `synthetic` (default), `trusted`, or `open`
+  - `synthetic`: the host intercepts DNS lookups and maps hostnames to
+    synthetic IP addresses (required for SSH egress proxy)
+  - `trusted`: forward DNS queries to one or more trusted resolvers
+  - `open`: unrestricted DNS
+
+- `--dns-trusted-server IP`
+  - Trusted resolver IPv4 address (repeatable; requires `--dns trusted`)
+
+- `--dns-synthetic-host-mapping MODE`
+  - Hostname-to-IP mapping strategy when using synthetic DNS: `single` or `per-host`
 
 Examples:
 
@@ -186,8 +201,24 @@ export GIT_SSH_COMMAND='ssh \
 Start an interactive `bash` session in the VM:
 
 ```bash
-gondolin bash [options]
+gondolin bash [options] [-- COMMAND [ARGS...]]
 ```
+
+If `-- COMMAND` is provided, the given command is run instead of the default
+`bash` shell.
+
+#### Bash-specific Options
+
+- `--cwd PATH` -- set the working directory for the shell / command
+- `--env KEY=VALUE` -- set an environment variable (repeatable)
+- `--listen [HOST:PORT]` -- start a host ingress gateway (default: `127.0.0.1:0`)
+
+#### Debugging Options (bash only)
+
+- `--ssh` -- enable SSH access to the VM via a localhost port forward
+- `--ssh-user USER` -- SSH username (default: `root`)
+- `--ssh-port PORT` -- local listen port (default: `0` = ephemeral)
+- `--ssh-listen HOST` -- local listen host (default: `127.0.0.1`)
 
 Typical workflows:
 
@@ -199,6 +230,12 @@ gondolin bash --mount-hostfs "$PWD:/workspace"
 gondolin bash \
   --mount-hostfs "$PWD:/workspace" \
   --host-secret GITHUB_TOKEN@api.github.com
+
+# Run a specific command instead of bash
+gondolin bash -- claude --cwd /workspace
+
+# Start an ingress gateway to forward traffic into the VM
+gondolin bash --listen 127.0.0.1:3000
 ```
 
 ### `gondolin exec`

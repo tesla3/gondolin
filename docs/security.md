@@ -78,7 +78,8 @@ This is a rough overview of the system today.
   - `sandboxd` executes commands requested by the host over virtio-serial
   - `sandboxfs` is a FUSE filesystem that proxies filesystem operations to the host over RPC
   - `sandboxssh` is a dedicated virtio-serial TCP forwarder for *loopback-only* connections inside the guest
-  - `/init` sets up tmpfs mounts, networking, starts `sandboxfs`, then starts `sandboxd`
+  - `sandboxingress` is a dedicated virtio-serial TCP forwarder for *loopback-only* ingress connections (host-to-guest HTTP routing)
+  - `/init` sets up tmpfs mounts, networking, starts `sandboxfs`, `sandboxssh`, `sandboxingress`, then starts `sandboxd`
 
 ### Trust Boundaries
 
@@ -138,6 +139,7 @@ Key enforcement points:
     - For each outgoing TCP flow, the host sniffs the first bytes and classifies it as:
         - `http` (HTTP/1.x request line)
         - `tls` (TLS ClientHello record)
+        - `ssh` (SSH version banner on configured SSH ports, only when SSH egress is enabled)
         - otherwise **denied** (`unknown-protocol`)
     - HTTP `CONNECT` is explicitly denied (`connect-not-allowed`).
 

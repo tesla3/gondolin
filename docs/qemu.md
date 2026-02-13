@@ -27,7 +27,7 @@ From inside the VM, the guest sees familiar devices:
 
 - A block device for the root filesystem
 - A network interface (typically as eth0)
-- One or more virtio-serial ports used for control and services
+- Four virtio-serial ports used for exec control, VFS RPC, SSH forwarding, and ingress
 
 The guest experience is intentionally "normal Linux" so that standard tooling
 works without custom kernels or unusual userspace stacks.
@@ -35,7 +35,7 @@ works without custom kernels or unusual userspace stacks.
 ## How Gondolin Connects to QEMU
 
 Gondolin runs QEMU as a child process and connects to it over local transports
-(Unix domain sockets and file descriptors).  The host side is responsible for:
+(Unix domain sockets).  The host side is responsible for:
 
 - Launching and shutting down the VM process
 - Wiring up virtio channels used for exec control and filesystem RPC
@@ -67,7 +67,7 @@ Instead, Gondolin uses:
 
 - virtio-net for a normal guest network interface
 - a host network backend that receives and emits frames
-- virtio-serial ports for structured control protocols (exec, VFS RPC, and other services)
+- virtio-serial ports for structured control protocols (exec, VFS RPC, SSH forwarding, and ingress)
 
 This combination is stable, well-understood, and keeps the guest environment conventional.
 
@@ -149,7 +149,7 @@ the expected virtio devices.
 
 Both platforms use local IPC primitives to connect to QEMU.  The details differ:
 
-- Linux: Unix sockets and file descriptor passing are common and predictable.
+- Linux: Unix sockets are common and predictable.
 - macOS: Unix sockets are also available, but filesystem and sandboxing rules can differ.
 
 Gondolin treats these as implementation details and keeps them behind the host

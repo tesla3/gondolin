@@ -39,7 +39,7 @@ Design your workloads so that throwing away a VM is always safe.  This means:
 | Location | Backing | Survives VM close? | In disk checkpoints? |
 |---|---|---|---|
 | Most of `/` (rootfs) | qcow2 overlay | No | Yes |
-| `/root`, `/tmp`, `/var/log` | tmpfs | No | No |
+| `/root`, `/tmp`, `/run`, `/var/log`, `/var/tmp`, `/var/cache` | tmpfs | No | No |
 | VFS-mounted paths (e.g. `/workspace`) | Host provider | Yes (provider-dependent) | No |
 
 The key takeaway: if you need data to survive, write it to a VFS mount or

@@ -56,7 +56,8 @@ Guest daemons/components:
 
 - `sandboxd`: receives exec requests and spawns processes
 - `sandboxfs`: a FUSE daemon that forwards filesystem operations to the host via RPC
-- `sandboxssh`: a dedicated host-to-guest TCP forwarder (loopback-only inside the guest)
+- `sandboxssh`: a dedicated host-to-guest TCP forwarder for SSH access (loopback-only inside the guest)
+- `sandboxingress`: a dedicated host-to-guest TCP forwarder for inbound HTTP traffic (ingress gateway)
 - `/init`: mounts tmpfs, brings up networking, starts services
 
 ### QEMU
@@ -79,9 +80,10 @@ See [QEMU](./qemu.md) for details.
 |  |                                                                         | |
 |  |  [virtio-net]   eth0  <---- Ethernet frames ---->  host network backend | |
 |  |                                                                         | |
-|  |  [virtio-serial]  exec RPC  <------------------>  sandbox server        | |
-|  |  [virtio-serial]  fs RPC    <------------------>  VFS RPC service       | |
-|  |  [virtio-serial]  ssh fwd   <------------------>  loopback-only proxy   | |
+|  |  [virtio-serial]  exec RPC    <---------------->  sandbox server        | |
+|  |  [virtio-serial]  fs RPC      <---------------->  VFS RPC service       | |
+|  |  [virtio-serial]  ssh fwd     <---------------->  loopback-only proxy   | |
+|  |  [virtio-serial]  ingress fwd <---------------->  ingress gateway       | |
 |  +-------------------------------------------------------------------------+ |
 |                                                                              |
 +------------------------------------------------------------------------------+
@@ -126,8 +128,8 @@ On the host side, Gondolin does **not** provide a generic NAT. Instead:
 
 1. The guest emits Ethernet frames via virtio-net.
 2. The host receives frames and implements a small userspace network stack.
-3. Outbound TCP flows are classified as **HTTP** or **TLS** (anything else is
-   blocked).
+3. Outbound TCP flows are classified as **HTTP**, **TLS**, or **SSH** (anything
+   else is blocked).
 4. HTTP requests are parsed, checked against policy, optionally transformed
    (hooks), and replayed via host `fetch`.
 5. For TLS flows, the host performs a controlled MITM so it can see the HTTP

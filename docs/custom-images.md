@@ -35,10 +35,9 @@ Building custom images requires the following tools:
 
 | Tool | Purpose |
 |------|---------|
-| **Zig 0.15.2** | Cross-compiling sandboxd/sandboxfs binaries |
+| **Zig 0.15.1+** | Cross-compiling sandboxd/sandboxfs binaries |
+| **cpio** | Creating initramfs archives |
 | **lz4** | Initramfs compression |
-| **curl** | Downloading Alpine packages |
-| **python3** | Package dependency resolution |
 | **e2fsprogs** | Creating ext4 rootfs images (mke2fs) |
 
 ### macOS
@@ -52,8 +51,8 @@ The build tries to locate `mke2fs` automatically (including common Homebrew loca
 ### Linux (Debian/Ubuntu)
 
 ```bash
-# Install Zig 0.15.2 from https://ziglang.org/download/
-sudo apt install lz4 curl python3 e2fsprogs
+# Install Zig 0.15.1+ from https://ziglang.org/download/
+sudo apt install lz4 cpio e2fsprogs
 ```
 
 ## Configuration Reference
@@ -88,7 +87,8 @@ The file has the following structure:
       "nodejs",
       "npm",
       "uv",
-      "python3"
+      "python3",
+      "openssh"
     ],
     "initramfsPackages": []
   },
@@ -117,6 +117,8 @@ The file has the following structure:
 | `container` | object | Container build settings (for cross-platform) |
 | `sandboxdPath` | string | Path to custom sandboxd binary |
 | `sandboxfsPath` | string | Path to custom sandboxfs binary |
+| `sandboxsshPath` | string | Path to custom sandboxssh binary |
+| `sandboxingressPath` | string | Path to custom sandboxingress binary |
 
 #### Baked-in environment (`env`)
 
@@ -152,6 +154,7 @@ Because `env` is stored in the image, **do not put real secrets here**.
 |-------|------|-------------|
 | `rootfsInit` | string | Path to custom rootfs init script |
 | `initramfsInit` | string | Path to custom initramfs init script |
+| `rootfsInitExtra` | string | Path to a shell script appended to the rootfs init before sandboxd starts |
 
 ### Post-Build Configuration
 
