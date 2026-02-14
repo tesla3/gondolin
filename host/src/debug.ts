@@ -9,7 +9,7 @@ export type DebugFlag = "net" | "exec" | "vfs" | "protocol";
  */
 export type DebugConfig = boolean | ReadonlyArray<DebugFlag>;
 
-export const ALL_DEBUG_FLAGS: ReadonlyArray<DebugFlag> = ["net", "exec", "vfs", "protocol"];
+const ALL_DEBUG_FLAGS: ReadonlyArray<DebugFlag> = ["net", "exec", "vfs", "protocol"];
 
 /**
  * Component identifier passed to debug log callbacks
@@ -26,7 +26,7 @@ export function defaultDebugLog(component: DebugComponent, message: string) {
   console.log(formatDebugLine(component, message));
 }
 
-export function formatDebugLine(component: DebugComponent, message: string) {
+function formatDebugLine(component: DebugComponent, message: string) {
   const trimmed = stripTrailingNewline(message);
   return `[${component}] ${trimmed}`;
 }

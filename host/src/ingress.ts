@@ -1587,7 +1587,7 @@ export function createGondolinEtcMount(provider: VirtualProvider): GondolinEtcMo
   return { provider, listeners };
 }
 
-export function isGondolinListenersRelevantPath(path: string | undefined): boolean {
+function isGondolinListenersRelevantPath(path: string | undefined): boolean {
   return path === "/etc/gondolin/listeners";
 }
 

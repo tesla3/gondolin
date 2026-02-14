@@ -186,7 +186,7 @@ export function resolveOutputMode(
   );
 }
 
-export function resolveWindowBytes(value: number | undefined): number {
+function resolveWindowBytes(value: number | undefined): number {
   if (value === undefined) return DEFAULT_WINDOW_BYTES;
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return DEFAULT_WINDOW_BYTES;

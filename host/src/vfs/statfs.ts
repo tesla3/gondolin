@@ -8,7 +8,7 @@ type MaybeStatfsProvider = {
   statfs?: (path: string) => Promise<VfsStatfs>;
 };
 
-export const SYNTHETIC_STATFS: Readonly<VfsStatfs> = Object.freeze({
+const SYNTHETIC_STATFS: Readonly<VfsStatfs> = Object.freeze({
   bsize: 4096,
   frsize: 4096,
   blocks: 16_777_216, // 64 GiB at 4 KiB blocks

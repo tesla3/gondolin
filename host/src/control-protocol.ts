@@ -128,7 +128,7 @@ export type ServerMessage = ExecResponseMessage | ErrorMessage | StatusMessage;
 
 export type OutputStream = "stdout" | "stderr";
 
-export const OUTPUT_HEADER_BYTES = 5;
+const OUTPUT_HEADER_BYTES = 5;
 
 export function encodeOutputFrame(id: number, stream: OutputStream, data: Buffer): Buffer {
   if (!Number.isInteger(id) || id < 0 || id > 0xffffffff) {

@@ -4,7 +4,7 @@ import os from "os";
 import path from "path";
 import { randomUUID } from "crypto";
 
-export type Qcow2CreateOptions = {
+type Qcow2CreateOptions = {
   /** overlay file path */
   path: string;
   /** backing file path */
@@ -24,7 +24,7 @@ export function ensureQemuImgAvailable(): void {
   execFileSync("qemu-img", ["--version"], { stdio: "ignore" });
 }
 
-export function createQcow2Overlay(opts: Qcow2CreateOptions): void {
+function createQcow2Overlay(opts: Qcow2CreateOptions): void {
   const dir = path.dirname(opts.path);
   fs.mkdirSync(dir, { recursive: true });
 
@@ -70,9 +70,9 @@ export function moveFile(src: string, dst: string): void {
   }
 }
 
-export type QemuImgInfo = Record<string, unknown>;
+type QemuImgInfo = Record<string, unknown>;
 
-export function qemuImgInfoJson(imagePath: string): QemuImgInfo {
+function qemuImgInfoJson(imagePath: string): QemuImgInfo {
   const raw = execFileSync("qemu-img", ["info", "--output=json", imagePath], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],

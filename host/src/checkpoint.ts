@@ -498,9 +498,3 @@ export class VmCheckpoint {
   }
 }
 
-export const __test = {
-  defaultCheckpointDir,
-  sanitizeName,
-  resolveAssetDirByBuildId,
-  ensureCheckpointBackedByRootfs,
-};

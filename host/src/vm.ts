@@ -241,8 +241,6 @@ export type VmDeleteFileOptions = {
   signal?: AbortSignal;
 };
 
-// Re-export types from exec.ts
-export { ExecProcess, ExecResult, ExecOptions } from "./exec";
 
 export type VMState = SandboxState | "unknown";
 
