@@ -95,6 +95,7 @@ export type {
   HttpIpAllowInfo,
   HttpHooks,
   HttpHookRequest,
+  HttpHookRequestHeadResult,
   HttpFetch,
 } from "./qemu-net";
 export { HttpRequestBlockedError } from "./qemu-net";

@@ -413,7 +413,7 @@ const { httpHooks, env } = createHttpHooks({
   blockInternalRanges: true, // default: true
   isRequestAllowed: (req) => req.method !== "DELETE",
   isIpAllowed: ({ ip }) => !ip.startsWith("203.0.113."),
-  onRequest: async (req) => {
+  onRequestHead: async (req) => {
     console.log(req.url);
     return req;
   },

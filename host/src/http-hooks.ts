@@ -23,8 +23,12 @@ export type CreateHttpHooksOptions = {
   isRequestAllowed?: HttpHooks["isRequestAllowed"];
   /** custom ip policy callback */
   isIpAllowed?: HttpHooks["isIpAllowed"];
-  /** request hook */
+
+  /** request head hook */
+  onRequestHead?: HttpHooks["onRequestHead"];
+  /** buffered request hook */
   onRequest?: HttpHooks["onRequest"];
+
   /** response hook */
   onResponse?: HttpHooks["onResponse"];
 };
@@ -66,6 +70,30 @@ export function createHttpHooks(options: CreateHttpHooksOptions = {}): CreateHtt
     ...secretEntries.flatMap((entry) => entry.hosts),
   ]);
 
+  const applySecretsToRequest = (request: HttpHookRequest): HttpHookRequest => {
+    const hostname = getHostname(request);
+
+    // Defense-in-depth: if the request already contains real secret values (eg: because
+    // it was constructed from a redirected hop), make sure we still enforce per-secret
+    // destination allowlists.
+    assertSecretValuesAllowedForHost(
+      request,
+      hostname,
+      secretEntries,
+      options.replaceSecretsInQuery ?? false
+    );
+
+    const headers = replaceSecretPlaceholdersInHeaders(request, hostname, secretEntries);
+    const url = replaceSecretPlaceholdersInUrlParameters(
+      request.url,
+      hostname,
+      secretEntries,
+      options.replaceSecretsInQuery ?? false
+    );
+
+    return { ...request, url, headers };
+  };
+
   const httpHooks: HttpHooks = {
     isRequestAllowed: async (request) => {
       if (options.isRequestAllowed) {
@@ -87,26 +115,62 @@ export function createHttpHooks(options: CreateHttpHooksOptions = {}): CreateHtt
       }
       return true;
     },
-    onRequest: async (request) => {
-      const hostname = getHostname(request);
-      const headers = replaceSecretPlaceholdersInHeaders(request, hostname, secretEntries);
-      const url = replaceSecretPlaceholdersInUrlParameters(
-        request.url,
-        hostname,
-        secretEntries,
-        options.replaceSecretsInQuery ?? false
-      );
-      let nextRequest: HttpHookRequest = { ...request, url, headers };
+    onRequestHead: async (request) => {
+      // Run user hooks first so any URL/Host rewrites are taken into account when
+      // evaluating which secrets may be substituted.
+      let nextRequest: HttpHookRequest = request;
 
-      if (options.onRequest) {
-        const updated = await options.onRequest(nextRequest);
-        if (updated) nextRequest = updated;
+      if (options.onRequestHead) {
+        const updated = await options.onRequestHead(nextRequest);
+        if (updated) {
+          // `onRequestHead` may return extra control fields; preserve them.
+          nextRequest = updated as unknown as HttpHookRequest;
+        }
       }
 
-      return nextRequest;
+      // qemu-net may call `httpHooks.onRequest` later (buffered bodies) or immediately
+      // (eg: WebSocket handshake has no body). Preserve a copy of the head to feed into
+      // `onRequest`.
+      const requestForBodyHook = options.onRequest
+        ? ({
+            method: nextRequest.method,
+            url: nextRequest.url,
+            headers: nextRequest.headers,
+            body: null,
+          } satisfies HttpHookRequest)
+        : null;
+
+      const substituted = applySecretsToRequest(nextRequest);
+      const out: any = {
+        ...nextRequest,
+        url: substituted.url,
+        headers: substituted.headers,
+      };
+      if (requestForBodyHook && out.requestForBodyHook == null) {
+        out.requestForBodyHook = requestForBodyHook;
+      }
+
+      return out;
     },
     onResponse: options.onResponse,
   };
+
+  // Only install `onRequest` when the caller explicitly provides it; in qemu-net,
+  // the presence of `httpHooks.onRequest` implies that request bodies must be buffered.
+  if (options.onRequest) {
+    httpHooks.onRequest = async (request) => {
+      // Run the buffered hook first so rewrites can influence secret allowlist checks.
+      let nextRequest: HttpHookRequest = request;
+
+      const updated = await options.onRequest!(nextRequest);
+      if (updated) nextRequest = updated;
+
+      // Inject secrets at the last possible moment (after rewrites).
+      nextRequest = applySecretsToRequest(nextRequest);
+
+      return nextRequest;
+    };
+  }
 
   return { httpHooks, env, allowedHosts };
 }
@@ -117,6 +181,89 @@ function getHostname(request: HttpHookRequest): string {
   } catch {
     return "";
   }
+}
+
+function assertSecretValuesAllowedForHost(
+  request: HttpHookRequest,
+  hostname: string,
+  entries: SecretEntry[],
+  checkQuery: boolean
+) {
+  if (entries.length === 0) return;
+
+  for (const entry of entries) {
+    // If the destination is allowed for this secret, we don't care whether the secret
+    // value already appears in the request.
+    if (matchesAnyHost(hostname, entry.hosts)) continue;
+
+    if (requestContainsSecretValueInHeaders(request.headers, entry)) {
+      throw new HttpRequestBlockedError(
+        `secret ${entry.name} not allowed for host: ${hostname || "unknown"}`
+      );
+    }
+
+    if (checkQuery && requestContainsSecretValueInQuery(request.url, entry)) {
+      throw new HttpRequestBlockedError(
+        `secret ${entry.name} not allowed for host: ${hostname || "unknown"}`
+      );
+    }
+  }
+}
+
+function requestContainsSecretValueInHeaders(headers: Record<string, string>, entry: SecretEntry): boolean {
+  if (!entry.value) return false;
+
+  for (const [headerName, headerValue] of Object.entries(headers)) {
+    if (!headerValue) continue;
+
+    // Plaintext match (eg: Authorization: Bearer <token>)
+    if (headerValue.includes(entry.value)) {
+      return true;
+    }
+
+    // Basic auth uses base64 encoding
+    if (/^(authorization|proxy-authorization)$/i.test(headerName)) {
+      const decoded = decodeBasicAuth(headerValue);
+      if (decoded && decoded.includes(entry.value)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function decodeBasicAuth(value: string): string | null {
+  const match = value.match(/^(Basic)(\s+)(\S+)(\s*)$/i);
+  if (!match) return null;
+
+  const token = match[3];
+  try {
+    return Buffer.from(token, "base64").toString("utf8");
+  } catch {
+    return null;
+  }
+}
+
+function requestContainsSecretValueInQuery(url: string, entry: SecretEntry): boolean {
+  if (!entry.value) return false;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+
+  if (!parsed.search) return false;
+
+  for (const [name, value] of parsed.searchParams.entries()) {
+    if (name.includes(entry.value) || value.includes(entry.value)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function replaceSecretPlaceholdersInHeaders(

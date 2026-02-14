@@ -201,8 +201,8 @@ Gondolin's secret strategy is:
 
 - The guest receives **random placeholders** as environment variables (e.g.
   `GONDOLIN_SECRET_<random>`).
-- When the guest makes an HTTP request, the host's request hook
-  (`createHttpHooks().httpHooks.onRequest`) scans outbound headers and **replaces
+- When the guest makes an HTTP request, the host's request head hook
+  (`createHttpHooks().httpHooks.onRequestHead`) scans outbound headers and **replaces
   placeholders with real secret values** *only* if the destination hostname
   matches the secret's host allowlist.
   - URL query parameter replacement is available only as an explicit opt-in
@@ -323,7 +323,8 @@ These are rules to not compromise the security guarantees of the system:
     - If you mount sensitive host data read-write/read-only, consider it exfiltratable to allowed hosts.
 
 4. **If you allow more than one host, add auditing**
-    - Use `httpHooks.onRequest` / `onResponse` to log and/or block unexpected paths or methods.
+    - Use `httpHooks.onRequestHead` / `onResponse` to log and/or block unexpected paths or methods
+    - Use `httpHooks.onRequest` only when you explicitly need the buffered request body
 
 ### Secrets
 

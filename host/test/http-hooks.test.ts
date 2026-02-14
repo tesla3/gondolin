@@ -305,7 +305,7 @@ test("http hooks replace secret placeholders", async () => {
 
   assert.ok(allowedHosts.includes("example.com"));
 
-  const request = await httpHooks.onRequest!({
+  const request = await httpHooks.onRequestHead!({
     method: "GET",
     url: "https://example.com/data",
     headers: {
@@ -328,7 +328,7 @@ test("http hooks keep placeholders in URL parameters by default", async () => {
   });
 
   const originalUrl = `https://example.com/data?token=${env.API_KEY}`;
-  const request = await httpHooks.onRequest!({
+  const request = await httpHooks.onRequestHead!({
     method: "GET",
     url: originalUrl,
     headers: {},
@@ -349,7 +349,7 @@ test("http hooks can replace placeholders in URL parameters when enabled", async
     replaceSecretsInQuery: true,
   });
 
-  const request = await httpHooks.onRequest!({
+  const request = await httpHooks.onRequestHead!({
     method: "GET",
     url: `https://example.com/data?token=${env.API_KEY}&ok=1`,
     headers: {},
@@ -373,7 +373,7 @@ test("http hooks reject URL parameter secrets on disallowed hosts when enabled",
 
   await assert.rejects(
     () =>
-      httpHooks.onRequest!({
+      httpHooks.onRequestHead!({
         method: "GET",
         url: `https://example.org/data?token=${env.API_KEY}`,
         headers: {},
@@ -402,7 +402,7 @@ test("http hooks replace secret placeholders in basic auth", async () => {
   );
   const expectedToken = Buffer.from("alice:s3cr3t", "utf8").toString("base64");
 
-  const request = await httpHooks.onRequest!({
+  const request = await httpHooks.onRequestHead!({
     method: "GET",
     url: "https://example.com/data",
     headers: {
@@ -434,7 +434,7 @@ test("http hooks reject basic auth secrets on disallowed hosts", async () => {
 
   await assert.rejects(
     () =>
-      httpHooks.onRequest!({
+      httpHooks.onRequestHead!({
         method: "GET",
         url: "https://example.org/data",
         headers: {
@@ -458,9 +458,63 @@ test("http hooks reject secrets on disallowed hosts", async () => {
 
   await assert.rejects(
     () =>
-      httpHooks.onRequest!({
+      httpHooks.onRequestHead!({
         method: "GET",
         url: "https://example.org/data",
+        headers: {
+          authorization: `Bearer ${env.API_KEY}`,
+        },
+        body: null,
+      }),
+    (err) => err instanceof HttpRequestBlockedError
+  );
+});
+
+test("http hooks reject already-substituted secrets on disallowed hosts", async () => {
+  const { httpHooks } = createHttpHooks({
+    secrets: {
+      API_KEY: {
+        hosts: ["example.com"],
+        value: "secret-value",
+      },
+    },
+  });
+
+  await assert.rejects(
+    () =>
+      httpHooks.onRequestHead!({
+        method: "GET",
+        url: "https://example.org/data",
+        headers: {
+          authorization: "Bearer secret-value",
+        },
+        body: null,
+      }),
+    (err) => err instanceof HttpRequestBlockedError
+  );
+});
+
+test("http hooks reject secrets if onRequestHead rewrites the destination", async () => {
+  const { httpHooks, env } = createHttpHooks({
+    secrets: {
+      API_KEY: {
+        hosts: ["example.com"],
+        value: "secret-value",
+      },
+    },
+    onRequestHead: (req) => ({
+      ...req,
+      // Simulate a rewrite (eg: proxying / rewriting destinations)
+      url: "https://example.org/data",
+    }),
+  });
+
+  // Secret substitution must use the *final* destination, and block here.
+  await assert.rejects(
+    () =>
+      httpHooks.onRequestHead!({
+        method: "GET",
+        url: "https://example.com/data",
         headers: {
           authorization: `Bearer ${env.API_KEY}`,
         },
@@ -496,7 +550,10 @@ test("http hooks pass request through custom handler", async () => {
     body: null,
   });
 
-  assert.deepEqual(seenAuth, ["Bearer secret-value"]);
+  // User hooks run before secret substitution, so they only see placeholders.
+  assert.deepEqual(seenAuth, [`Bearer ${env.API_KEY}`]);
+
+  // The request returned to the bridge has secrets substituted.
   assert.equal(request.headers.authorization, "Bearer secret-value");
   assert.equal(request.headers["x-extra"], "1");
 });
@@ -525,6 +582,9 @@ test("http hooks preserve request when handler returns void", async () => {
     body: null,
   });
 
-  assert.deepEqual(seenAuth, ["Bearer secret-value"]);
+  // User hooks run before secret substitution, so they only see placeholders.
+  assert.deepEqual(seenAuth, [`Bearer ${env.API_KEY}`]);
+
+  // The request returned to the bridge has secrets substituted.
   assert.equal(request.headers.authorization, "Bearer secret-value");
 });

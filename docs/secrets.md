@@ -74,10 +74,14 @@ still added to the allowed host set.
 
 ## Hook Ordering
 
-Within `createHttpHooks`, secret replacement runs **before** your custom
-`onRequest` callback. That means your `onRequest` sees real secret values.
+`createHttpHooks` applies secret replacement as part of its hook implementation.
 
-If you log full headers in `onRequest`, you can leak secrets into logs.
+Important:
+
+- There is **no guarantee** that custom hooks (`onRequestHead` / `onRequest` / `onResponse`) will only see placeholders
+- Depending on control flow (for example redirects), hooks may observe requests where some secrets are already substituted
+
+Do not log request headers/URLs from hooks unless you are comfortable potentially logging real secret values.
 
 ## CLI Equivalent
 

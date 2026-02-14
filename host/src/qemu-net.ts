@@ -35,6 +35,13 @@ import {
 const MAX_HTTP_REDIRECTS = 10;
 const MAX_HTTP_HEADER_BYTES = 64 * 1024;
 const MAX_HTTP_PIPELINE_BYTES = 64 * 1024;
+
+// When streaming request bodies (Content-Length, no buffering), keep the internal
+// ReadableStream queue bounded and apply coarse-grained backpressure to QEMU.
+const HTTP_STREAMING_REQUEST_BODY_HIGH_WATER_BYTES = 64 * 1024;
+const HTTP_STREAMING_RX_PAUSE_HIGH_WATER_BYTES = 512 * 1024;
+const HTTP_STREAMING_RX_PAUSE_LOW_WATER_BYTES = 256 * 1024;
+
 // Chunked framing (chunk-size lines + trailers) can add overhead on top of the decoded body.
 // Keep this bounded separately from maxHttpBodyBytes.
 const MAX_HTTP_CHUNKED_OVERHEAD_BYTES = 256 * 1024;
@@ -795,6 +802,47 @@ type HttpSession = {
   buffer: HttpReceiveBuffer;
   processing: boolean;
   closed: boolean;
+
+  /** cached request head state (we only process one HTTP request per TCP session) */
+  head?: {
+    method: string;
+    target: string;
+    version: string;
+    headers: Record<string, string>;
+    bodyOffset: number;
+
+    hookRequest: HttpHookRequest;
+    /** request head used as the base for `httpHooks.onRequest` */
+    hookRequestForBodyHook?: HttpHookRequest | null;
+    bufferRequestBody: boolean;
+    maxBodyBytes: number;
+
+    bodyMode: "none" | "content-length" | "chunked";
+    contentLength: number;
+  };
+
+  /** active streaming request body state (Content-Length only) */
+  streamingBody?: {
+    /** bytes remaining in the declared Content-Length body in `bytes` */
+    remaining: number;
+    /** upstream body stream controller */
+    controller: ReadableStreamDefaultController<Uint8Array> | null;
+    /** whether the body stream is complete or canceled */
+    done: boolean;
+    /** bytes observed after body completion in `bytes` (HTTP pipelining/coalescing) */
+    pipelineBytes: number;
+
+    /** pending body chunks not yet enqueued into the ReadableStream */
+    pending: Buffer[];
+    /** pending body bytes not yet enqueued into the ReadableStream in `bytes` */
+    pendingBytes: number;
+    /** close the stream after pending bytes are drained */
+    closeAfterPending: boolean;
+
+    /** drains pending chunks into the ReadableStream while respecting backpressure */
+    drain: () => void;
+  };
+
   /** whether we already sent an interim 100-continue response */
   sentContinue?: boolean;
 };
@@ -1074,13 +1122,30 @@ export class HttpRequestBlockedError extends Error {
   }
 }
 
+export type HttpHookRequestHeadResult = HttpHookRequest & {
+  /** whether the request body must be buffered before calling `httpHooks.onRequest` */
+  bufferRequestBody?: boolean;
+  /** max request body size in `bytes` (applies to both buffered bodies and streaming via Content-Length) */
+  maxBufferedRequestBodyBytes?: number;
+
+  /** request head to pass into `httpHooks.onRequest` when buffering is enabled */
+  requestForBodyHook?: HttpHookRequest;
+};
+
 export type HttpHooks = {
-  /** allow/deny callback for request content */
+  /** allow/deny callback for request content (request body is always `null`) */
   isRequestAllowed?: (request: HttpHookRequest) => Promise<boolean> | boolean;
   /** allow/deny callback for resolved destination ip */
   isIpAllowed?: (info: HttpIpAllowInfo) => Promise<boolean> | boolean;
-  /** request rewrite hook */
+
+  /** request rewrite hook for the request head (method/url/headers only; body is always `null`) */
+  onRequestHead?: (
+    request: HttpHookRequest
+  ) => Promise<HttpHookRequestHeadResult | void> | HttpHookRequestHeadResult | void;
+
+  /** request rewrite hook for buffered requests (request body is provided as a Buffer) */
   onRequest?: (request: HttpHookRequest) => Promise<HttpHookRequest | void> | HttpHookRequest | void;
+
   /** response rewrite hook */
   onResponse?: (
     response: HttpHookResponse,
@@ -1169,6 +1234,7 @@ export class QemuNetworkBackend extends EventEmitter {
   private server: net.Server | null = null;
   private socket: net.Socket | null = null;
   private waitingDrain = false;
+  private qemuRxPausedForHttpStreaming = false;
   private stack: NetworkStack | null = null;
   private readonly udpSessions = new Map<string, UdpSession>();
   private readonly tcpSessions = new Map<string, TcpSession>();
@@ -1428,6 +1494,7 @@ export class QemuNetworkBackend extends EventEmitter {
       this.socket.destroy();
       this.socket = null;
     }
+    this.qemuRxPausedForHttpStreaming = false;
     this.waitingDrain = false;
     this.cleanupSessions();
     this.closeSharedDispatchers();
@@ -1995,6 +2062,18 @@ export class QemuNetworkBackend extends EventEmitter {
   private handleTcpClose(message: TcpCloseMessage) {
     const session = this.tcpSessions.get(message.key);
     if (session) {
+      if (session.http?.streamingBody && !session.http.streamingBody.done) {
+        const controller = session.http.streamingBody.controller;
+        try {
+          controller?.error(new Error("guest closed"));
+        } catch {
+          // ignore
+        }
+        session.http.streamingBody.done = true;
+        session.http.streamingBody.controller = null;
+        this.updateQemuRxPauseState();
+      }
+
       session.http = undefined;
       session.ws = undefined;
       session.pendingWrites = [];
@@ -2061,6 +2140,41 @@ export class QemuNetworkBackend extends EventEmitter {
     this.flowResumeWaiters.delete(key);
     for (const resolve of waiters) {
       resolve();
+    }
+  }
+
+  private getMaxHttpStreamingPendingBytes(): number {
+    let maxPending = 0;
+    for (const session of this.tcpSessions.values()) {
+      const pending = session.http?.streamingBody?.pendingBytes ?? 0;
+      if (pending > maxPending) maxPending = pending;
+    }
+    return maxPending;
+  }
+
+  private updateQemuRxPauseState() {
+    const socket = this.socket;
+    if (!socket) return;
+
+    const maxPending = this.getMaxHttpStreamingPendingBytes();
+
+    if (!this.qemuRxPausedForHttpStreaming && maxPending >= HTTP_STREAMING_RX_PAUSE_HIGH_WATER_BYTES) {
+      this.qemuRxPausedForHttpStreaming = true;
+      try {
+        socket.pause();
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    if (this.qemuRxPausedForHttpStreaming && maxPending <= HTTP_STREAMING_RX_PAUSE_LOW_WATER_BYTES) {
+      this.qemuRxPausedForHttpStreaming = false;
+      try {
+        socket.resume();
+      } catch {
+        // ignore
+      }
     }
   }
 
@@ -2731,71 +2845,323 @@ export class QemuNetworkBackend extends EventEmitter {
 
     if (httpSession.closed) return;
 
+    // If we are currently streaming a request body to the upstream fetch, forward
+    // bytes directly and avoid buffering.
+    if (httpSession.streamingBody) {
+      const streamState = httpSession.streamingBody;
+
+      if (data.length === 0) return;
+
+      // We only support a single HTTP request per TCP flow. If the guest pipelines
+      // additional bytes after the declared Content-Length, discard them (up to a
+      // strict cap) so the in-flight response can still be delivered.
+      if (streamState.done) {
+        streamState.pipelineBytes += data.length;
+        if (streamState.pipelineBytes > MAX_HTTP_PIPELINE_BYTES) {
+          httpSession.closed = true;
+          this.abortTcpSession(
+            key,
+            session,
+            `http-extra-bytes-after-body (${streamState.pipelineBytes} bytes)`
+          );
+        }
+        return;
+      }
+
+      const take = Math.min(streamState.remaining, data.length);
+      const extra = data.length - take;
+
+      if (take > 0) {
+        streamState.pending.push(data.subarray(0, take));
+        streamState.pendingBytes += take;
+        streamState.remaining -= take;
+        streamState.drain();
+      }
+
+      if (streamState.remaining === 0) {
+        streamState.done = true;
+        streamState.closeAfterPending = true;
+        streamState.drain();
+      }
+
+      if (extra > 0) {
+        streamState.pipelineBytes += extra;
+        if (streamState.pipelineBytes > MAX_HTTP_PIPELINE_BYTES) {
+          httpSession.closed = true;
+          this.abortTcpSession(
+            key,
+            session,
+            `http-body-pipeline-exceeds-cap (${streamState.pipelineBytes} bytes)`
+          );
+        }
+      }
+
+      return;
+    }
+
     httpSession.buffer.append(data);
     if (httpSession.processing) return;
 
-    let parsed: { request: HttpRequestData; remaining: Buffer } | null = null;
     try {
-      const headerEnd = httpSession.buffer.findHeaderEnd(MAX_HTTP_HEADER_BYTES + 4);
-      if (headerEnd === -1) {
-        // No header terminator yet.
-        if (httpSession.buffer.length > MAX_HTTP_HEADER_BYTES) {
+      // Parse + cache request head.
+      if (!httpSession.head) {
+        const headerEnd = httpSession.buffer.findHeaderEnd(MAX_HTTP_HEADER_BYTES + 4);
+        if (headerEnd === -1) {
+          if (httpSession.buffer.length > MAX_HTTP_HEADER_BYTES) {
+            throw new HttpRequestBlockedError(
+              `request headers exceed ${MAX_HTTP_HEADER_BYTES} bytes`,
+              431,
+              "Request Header Fields Too Large"
+            );
+          }
+          return;
+        }
+
+        if (headerEnd > MAX_HTTP_HEADER_BYTES) {
           throw new HttpRequestBlockedError(
             `request headers exceed ${MAX_HTTP_HEADER_BYTES} bytes`,
             431,
             "Request Header Fields Too Large"
           );
         }
-        return;
-      }
 
-      if (headerEnd > MAX_HTTP_HEADER_BYTES) {
-        throw new HttpRequestBlockedError(
-          `request headers exceed ${MAX_HTTP_HEADER_BYTES} bytes`,
-          431,
-          "Request Header Fields Too Large"
-        );
-      }
+        const headBuf = httpSession.buffer.prefix(headerEnd + 4);
+        const head = this.parseHttpHead(headBuf);
+        if (!head) return;
 
-      // Parse headers using only the header region (avoid concatenating the full buffer).
-      const headBuf = httpSession.buffer.prefix(headerEnd + 4);
-      const head = this.parseHttpHead(headBuf);
-      if (!head) return;
+        const bufferedBodyBytes = Math.max(0, httpSession.buffer.length - head.bodyOffset);
 
-      const bufferedBodyBytes = Math.max(0, httpSession.buffer.length - head.bodyOffset);
+        // Validate Expect early so we don't send 100-continue for requests we must reject.
+        this.validateExpectHeader(head.version, head.headers);
 
-      // Validate Expect early so we don't send 100-continue for requests we must reject.
-      this.validateExpectHeader(head.version, head.headers);
+        // Asterisk-form (OPTIONS *) is valid HTTP but does not map to a URL fetch.
+        if (head.method === "OPTIONS" && head.target === "*") {
+          const version: "HTTP/1.0" | "HTTP/1.1" = head.version === "HTTP/1.0" ? "HTTP/1.0" : "HTTP/1.1";
+          this.respondWithError(options.write, 501, "Not Implemented", version);
+          httpSession.closed = true;
+          options.finish();
+          this.flush();
+          return;
+        }
 
-      const transferEncodingHeader = head.headers["transfer-encoding"];
-      if (transferEncodingHeader) {
-        const encodings = transferEncodingHeader
-          .split(",")
-          .map((value) => value.trim().toLowerCase())
-          .filter(Boolean);
+        // Determine request body framing.
+        const transferEncodingHeader = head.headers["transfer-encoding"];
+        let bodyMode: "none" | "content-length" | "chunked" = "none";
+        let contentLength = 0;
 
-        // Only support TE: chunked (no other transfer-codings).
-        if (
-          encodings.length === 0 ||
-          encodings[encodings.length - 1] !== "chunked" ||
-          !encodings.every((encoding) => encoding === "chunked")
-        ) {
+        if (transferEncodingHeader) {
+          const encodings = transferEncodingHeader
+            .split(",")
+            .map((value) => value.trim().toLowerCase())
+            .filter(Boolean);
+
+          if (
+            encodings.length === 0 ||
+            encodings[encodings.length - 1] !== "chunked" ||
+            !encodings.every((encoding) => encoding === "chunked")
+          ) {
+            throw new HttpRequestBlockedError(
+              `unsupported transfer-encoding: ${transferEncodingHeader}`,
+              501,
+              "Not Implemented"
+            );
+          }
+
+          bodyMode = "chunked";
+        } else {
+          const contentLengthRaw = head.headers["content-length"];
+          if (contentLengthRaw) {
+            if (contentLengthRaw.includes(",")) {
+              throw new Error("multiple content-length headers");
+            }
+            contentLength = Number(contentLengthRaw);
+            if (
+              !Number.isFinite(contentLength) ||
+              !Number.isInteger(contentLength) ||
+              contentLength < 0
+            ) {
+              throw new Error("invalid content-length");
+            }
+          }
+
+          if (contentLength > 0) {
+            bodyMode = "content-length";
+          }
+        }
+
+        const dummyRequest: HttpRequestData = {
+          method: head.method,
+          target: head.target,
+          version: head.version,
+          headers: head.headers,
+          body: Buffer.alloc(0),
+        };
+
+        const hasUpgrade = (() => {
+          const connection = head.headers["connection"]?.toLowerCase() ?? "";
+          return (
+            Boolean(head.headers["upgrade"]) ||
+            connection
+              .split(",")
+              .map((t) => t.trim())
+              .filter(Boolean)
+              .includes("upgrade") ||
+            Boolean(head.headers["sec-websocket-key"]) ||
+            Boolean(head.headers["sec-websocket-version"])
+          );
+        })();
+
+        const upgradeIsWebSocket = this.isWebSocketUpgradeRequest(dummyRequest);
+        if (hasUpgrade && !(this.allowWebSockets && upgradeIsWebSocket)) {
+          const version: "HTTP/1.0" | "HTTP/1.1" = head.version === "HTTP/1.0" ? "HTTP/1.0" : "HTTP/1.1";
+          this.respondWithError(options.write, 501, "Not Implemented", version);
+          httpSession.closed = true;
+          options.finish();
+          this.flush();
+          return;
+        }
+
+        const url = this.buildFetchUrl(dummyRequest, options.scheme);
+        if (!url) {
+          const version: "HTTP/1.0" | "HTTP/1.1" = head.version === "HTTP/1.0" ? "HTTP/1.0" : "HTTP/1.1";
+          this.respondWithError(options.write, 400, "Bad Request", version);
+          httpSession.closed = true;
+          options.finish();
+          this.flush();
+          return;
+        }
+
+        const headHookBase: HttpHookRequest = {
+          method: head.method,
+          url,
+          headers: upgradeIsWebSocket
+            ? this.stripHopByHopHeadersForWebSocket(head.headers)
+            : this.stripHopByHopHeaders(head.headers),
+          body: null,
+        };
+
+        const headHooked = await this.applyRequestHeadHooks(headHookBase);
+
+        let maxBodyBytes = this.maxHttpBodyBytes;
+        if (headHooked.maxBufferedRequestBodyBytes !== null) {
+          maxBodyBytes = Math.min(maxBodyBytes, headHooked.maxBufferedRequestBodyBytes);
+        }
+
+        if (bodyMode === "content-length" && Number.isFinite(maxBodyBytes) && contentLength > maxBodyBytes) {
           throw new HttpRequestBlockedError(
-            `unsupported transfer-encoding: ${transferEncodingHeader}`,
-            501,
-            "Not Implemented"
+            `request body exceeds ${maxBodyBytes} bytes`,
+            413,
+            "Payload Too Large"
           );
         }
 
-        // Enforce a strict cap on the raw buffered request bytes.
+        // Validate request policy + IP policy on the (possibly rewritten) head.
+        let parsedUrl: URL;
+        try {
+          parsedUrl = new URL(headHooked.request.url);
+        } catch {
+          throw new HttpRequestBlockedError("invalid url", 400, "Bad Request");
+        }
+
+        const protocol = getUrlProtocol(parsedUrl);
+        if (!protocol) {
+          throw new HttpRequestBlockedError("unsupported protocol", 400, "Bad Request");
+        }
+
+        const port = getUrlPort(parsedUrl, protocol);
+        if (!Number.isFinite(port) || port <= 0) {
+          throw new HttpRequestBlockedError("invalid port", 400, "Bad Request");
+        }
+
+        await this.ensureRequestAllowed(headHooked.request);
+        await this.ensureIpAllowed(parsedUrl, protocol, port);
+
+        this.maybeSend100ContinueFromHead(httpSession, head, bufferedBodyBytes, options.write);
+
+        httpSession.head = {
+          method: head.method,
+          target: head.target,
+          version: head.version,
+          headers: head.headers,
+          bodyOffset: head.bodyOffset,
+          hookRequest: headHooked.request,
+          hookRequestForBodyHook: headHooked.requestForBodyHook,
+          bufferRequestBody: headHooked.bufferRequestBody,
+          maxBodyBytes,
+          bodyMode,
+          contentLength,
+        };
+      }
+
+      const state = httpSession.head;
+      if (!state) return;
+
+      const httpVersion: "HTTP/1.0" | "HTTP/1.1" =
+        state.version === "HTTP/1.0" ? "HTTP/1.0" : "HTTP/1.1";
+
+      // WebSocket upgrade handling (no request bodies allowed).
+      if (this.allowWebSockets) {
+        const stub: HttpRequestData = {
+          method: state.method,
+          target: state.target,
+          version: state.version,
+          headers: state.headers,
+          body: Buffer.alloc(0),
+        };
+
+        if (this.isWebSocketUpgradeRequest(stub)) {
+          if (state.bodyMode !== "none") {
+            throw new HttpRequestBlockedError("websocket upgrade requests must not have a body", 400, "Bad Request");
+          }
+
+          // Prevent further HTTP parsing on this TCP session; upgraded connections become opaque tunnels.
+          httpSession.closed = true;
+          httpSession.processing = true;
+
+          session.ws = session.ws ?? {
+            phase: "handshake",
+            upstream: null,
+            pending: [],
+            pendingBytes: 0,
+          };
+
+          // Anything already buffered after the request head is treated as early websocket data.
+          const early = httpSession.buffer.suffix(state.bodyOffset);
+          httpSession.buffer.resetTo(Buffer.alloc(0));
+          if (early.length > 0) {
+            this.handleWebSocketClientData(key, session, early);
+          }
+
+          let keepOpen = false;
+          try {
+            keepOpen = await this.handleWebSocketUpgrade(key, stub, session, options, httpVersion, {
+              headHookRequest: state.hookRequest,
+              headHookRequestForBodyHook: state.hookRequestForBodyHook ?? null,
+            });
+          } finally {
+            httpSession.processing = false;
+            if (!keepOpen) {
+              options.finish();
+              this.flush();
+            }
+          }
+          return;
+        }
+      }
+
+      // Buffering / streaming decision based on onRequestHead.
+      const bufferedBodyBytes = Math.max(0, httpSession.buffer.length - state.bodyOffset);
+
+      if (state.bodyMode === "chunked") {
+        // Currently chunked request bodies are always buffered.
         const maxBuffered =
-          head.bodyOffset +
-          this.maxHttpBodyBytes +
+          state.bodyOffset +
+          state.maxBodyBytes +
           MAX_HTTP_CHUNKED_OVERHEAD_BYTES +
           MAX_HTTP_PIPELINE_BYTES;
         if (httpSession.buffer.length > maxBuffered) {
           throw new HttpRequestBlockedError(
-            `request body exceeds ${this.maxHttpBodyBytes} bytes`,
+            `request body exceeds ${state.maxBodyBytes} bytes`,
             413,
             "Payload Too Large"
           );
@@ -2803,23 +3169,16 @@ export class QemuNetworkBackend extends EventEmitter {
 
         const chunked = this.decodeChunkedBodyFromReceiveBuffer(
           httpSession.buffer,
-          head.bodyOffset,
-          this.maxHttpBodyBytes
+          state.bodyOffset,
+          state.maxBodyBytes
         );
+
         if (!chunked.complete) {
-          this.maybeSend100ContinueFromHead(httpSession, head, bufferedBodyBytes, options.write);
+          this.maybeSend100ContinueFromHead(httpSession, state, bufferedBodyBytes, options.write);
           return;
         }
 
-        const sanitizedHeaders = { ...head.headers };
-        delete sanitizedHeaders["transfer-encoding"];
-        delete sanitizedHeaders["content-length"];
-        sanitizedHeaders["content-length"] = chunked.body.length.toString();
-
-        const remainingStart = head.bodyOffset + chunked.bytesConsumed;
-
-        // Now that we know the exact end of the chunked body, strictly enforce how many
-        // bytes we allow to be buffered past the chunked terminator.
+        const remainingStart = state.bodyOffset + chunked.bytesConsumed;
         if (httpSession.buffer.length - remainingStart > MAX_HTTP_PIPELINE_BYTES) {
           throw new HttpRequestBlockedError(
             `request pipeline exceeds ${MAX_HTTP_PIPELINE_BYTES} bytes`,
@@ -2828,162 +3187,390 @@ export class QemuNetworkBackend extends EventEmitter {
           );
         }
 
-        parsed = {
-          request: {
-            method: head.method,
-            target: head.target,
-            version: head.version,
-            headers: sanitizedHeaders,
-            body: chunked.body,
-          },
-          remaining: httpSession.buffer.suffix(remainingStart),
-        };
-      } else {
-        const contentLengthRaw = head.headers["content-length"];
-        let contentLength = 0;
-        if (contentLengthRaw) {
-          if (contentLengthRaw.includes(",")) {
-            throw new Error("multiple content-length headers");
-          }
-          contentLength = Number(contentLengthRaw);
-          if (
-            !Number.isFinite(contentLength) ||
-            !Number.isInteger(contentLength) ||
-            contentLength < 0
-          ) {
-            throw new Error("invalid content-length");
-          }
-        }
+        const remaining = httpSession.buffer.suffix(remainingStart);
+        httpSession.buffer.resetTo(remaining);
 
-        if (Number.isFinite(this.maxHttpBodyBytes) && contentLength > this.maxHttpBodyBytes) {
-          throw new HttpRequestBlockedError(
-            `request body exceeds ${this.maxHttpBodyBytes} bytes`,
-            413,
-            "Payload Too Large"
-          );
-        }
-
-        const maxBuffered = head.bodyOffset + contentLength + MAX_HTTP_PIPELINE_BYTES;
-        if (httpSession.buffer.length > maxBuffered) {
-          throw new HttpRequestBlockedError(
-            `request exceeds ${contentLength} bytes`,
-            413,
-            "Payload Too Large"
-          );
-        }
-
-        // If we know exactly how much body to expect, avoid attempting parse until complete.
-        if (bufferedBodyBytes < contentLength) {
-          this.maybeSend100ContinueFromHead(httpSession, head, bufferedBodyBytes, options.write);
-          return;
-        }
-
-        this.maybeSend100ContinueFromHead(httpSession, head, bufferedBodyBytes, options.write);
-
-        const fullBuffer = httpSession.buffer.toBuffer();
-        const result = this.parseHttpRequest(fullBuffer);
-        parsed = result
-          ? {
-              request: result.request,
-              remaining: Buffer.from(result.remaining),
-            }
-          : null;
-      }
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      if (error instanceof HttpRequestBlockedError) {
-        if (this.options.debug) {
-          this.emitDebug(`http blocked ${error.message}`);
-        }
-        this.respondWithError(options.write, error.status, error.statusText);
-      } else {
-        this.emit("error", error);
-        this.respondWithError(options.write, 400, "Bad Request");
-      }
-      httpSession.closed = true;
-      options.finish();
-      this.flush();
-      return;
-    }
-
-    if (!parsed) return;
-
-    const httpVersion: "HTTP/1.0" | "HTTP/1.1" =
-      parsed.request.version === "HTTP/1.0" ? "HTTP/1.0" : "HTTP/1.1";
-
-    httpSession.processing = true;
-    httpSession.buffer.resetTo(parsed.remaining);
-
-    let keepOpen = false;
-    let releaseHttpConcurrency: (() => void) | null = null;
-
-    try {
-      if (this.allowWebSockets && this.isWebSocketUpgradeRequest(parsed.request)) {
-        // Prevent further HTTP parsing on this TCP session; upgraded connections become opaque tunnels.
-        httpSession.closed = true;
-
-        // Initialize websocket state early so any subsequent guest bytes are buffered/forwarded
-        // as websocket frames rather than being parsed as HTTP.
-        session.ws = session.ws ?? {
-          phase: "handshake",
-          upstream: null,
-          pending: [],
-          pendingBytes: 0,
+        const body = chunked.body;
+        const baseHookRequest = state.hookRequestForBodyHook ?? state.hookRequest;
+        let hookRequest: HttpHookRequest = {
+          method: baseHookRequest.method,
+          url: baseHookRequest.url,
+          headers: { ...baseHookRequest.headers, "content-length": body.length.toString() },
+          body: body.length > 0 ? body : null,
         };
 
-        // Anything already buffered after the request head is treated as early websocket data.
-        const early = httpSession.buffer.toBuffer();
-        httpSession.buffer.resetTo(Buffer.alloc(0));
-        if (early.length > 0) {
-          this.handleWebSocketClientData(key, session, early);
+        if (state.bufferRequestBody) {
+          hookRequest = await this.applyRequestBodyHooks(hookRequest);
         }
 
-        keepOpen = await this.handleWebSocketUpgrade(key, parsed.request, session, options, httpVersion);
+        // Normalize framing headers for fetch.
+        hookRequest.headers = { ...hookRequest.headers };
+        delete hookRequest.headers["transfer-encoding"];
+        if (hookRequest.body) {
+          hookRequest.headers["content-length"] = hookRequest.body.length.toString();
+        } else {
+          delete hookRequest.headers["content-length"];
+        }
+
+        // If the buffered onRequest hook rewrote the destination or relevant headers,
+        // re-run request/ip policy checks against the final request.
+        if (
+          state.bufferRequestBody &&
+          !this.isSamePolicyRelevantRequestHead(hookRequest, state.hookRequest)
+        ) {
+          let parsedUrl: URL;
+          try {
+            parsedUrl = new URL(hookRequest.url);
+          } catch {
+            throw new HttpRequestBlockedError("invalid url", 400, "Bad Request");
+          }
+
+          const protocol = getUrlProtocol(parsedUrl);
+          if (!protocol) {
+            throw new HttpRequestBlockedError("unsupported protocol", 400, "Bad Request");
+          }
+
+          const port = getUrlPort(parsedUrl, protocol);
+          if (!Number.isFinite(port) || port <= 0) {
+            throw new HttpRequestBlockedError("invalid port", 400, "Bad Request");
+          }
+
+          await this.ensureRequestAllowed(hookRequest);
+          await this.ensureIpAllowed(parsedUrl, protocol, port);
+        }
+
+        httpSession.processing = true;
+        let releaseHttpConcurrency: (() => void) | null = null;
+        try {
+          releaseHttpConcurrency = await this.httpConcurrency.acquire();
+          await this.fetchHookRequestAndRespond({
+            request: hookRequest,
+            httpVersion,
+            write: options.write,
+            waitForWritable: options.waitForWritable,
+            hooksAppliedFirstHop: true,
+            policyCheckedFirstHop: true,
+            enableBodyHook: state.bufferRequestBody,
+          });
+        } finally {
+          releaseHttpConcurrency?.();
+          httpSession.processing = false;
+          httpSession.closed = true;
+          options.finish();
+          this.flush();
+        }
+
         return;
       }
 
-      releaseHttpConcurrency = await this.httpConcurrency.acquire();
-      await this.fetchAndRespond(
-        parsed.request,
-        options.scheme,
-        options.write,
-        options.waitForWritable
-      );
+      // Content-Length or no body.
+      const contentLength = state.contentLength;
+
+      const maxBuffered = state.bodyOffset + contentLength + MAX_HTTP_PIPELINE_BYTES;
+      if (httpSession.buffer.length > maxBuffered) {
+        throw new HttpRequestBlockedError(`request exceeds ${contentLength} bytes`, 413, "Payload Too Large");
+      }
+
+      if (!state.bufferRequestBody && contentLength > 0 && bufferedBodyBytes < contentLength) {
+        // If the client uses Expect: 100-continue, avoid starting the upstream fetch
+        // until we see at least one body byte (the client may be waiting).
+        const expect = state.headers["expect"]?.toLowerCase() ?? "";
+        if (expect.includes("100-continue") && bufferedBodyBytes === 0) {
+          return;
+        }
+
+        // Start streaming the request body to the upstream fetch.
+        const streamState: NonNullable<HttpSession["streamingBody"]> = {
+          remaining: contentLength,
+          controller: null,
+          done: false,
+          pipelineBytes: 0,
+          pending: [],
+          pendingBytes: 0,
+          closeAfterPending: false,
+          drain: () => {
+            const c: any = streamState.controller;
+            if (!c) return;
+
+            try {
+              while (streamState.pending.length > 0) {
+                const desired = typeof c.desiredSize === "number" ? c.desiredSize : 0;
+                if (desired <= 0) break;
+
+                const head = streamState.pending[0]!;
+                if (head.length <= desired) {
+                  c.enqueue(head);
+                  streamState.pending.shift();
+                  streamState.pendingBytes -= head.length;
+                } else {
+                  c.enqueue(head.subarray(0, desired));
+                  streamState.pending[0] = head.subarray(desired);
+                  streamState.pendingBytes -= desired;
+                }
+              }
+
+              if (streamState.closeAfterPending && streamState.pendingBytes === 0) {
+                streamState.closeAfterPending = false;
+                c.close();
+              }
+            } catch {
+              // The upstream fetch may have canceled/closed the request body stream early.
+              streamState.done = true;
+              streamState.controller = null;
+              streamState.pending.length = 0;
+              streamState.pendingBytes = 0;
+              streamState.closeAfterPending = false;
+            } finally {
+              this.updateQemuRxPauseState();
+            }
+          },
+        };
+
+        const bodyStream = new ReadableStream<Uint8Array>(
+          {
+            start: (c) => {
+              streamState.controller = c;
+              streamState.drain();
+            },
+            pull: (c) => {
+              streamState.controller = c;
+              streamState.drain();
+            },
+            cancel: () => {
+              streamState.done = true;
+              streamState.controller = null;
+              streamState.pending.length = 0;
+              streamState.pendingBytes = 0;
+              streamState.closeAfterPending = false;
+              this.updateQemuRxPauseState();
+            },
+          },
+          {
+            highWaterMark: HTTP_STREAMING_REQUEST_BODY_HIGH_WATER_BYTES,
+            size: (chunk: Uint8Array) => chunk.byteLength,
+          }
+        );
+
+        httpSession.streamingBody = streamState;
+
+        // Extract any already-buffered body bytes and clear the receive buffer.
+        const initialBody = httpSession.buffer.suffix(state.bodyOffset);
+        httpSession.buffer.resetTo(Buffer.alloc(0));
+
+        // Kick off the upstream fetch.
+        httpSession.processing = true;
+        let releaseHttpConcurrency: (() => void) | null = null;
+
+        // Normalize framing headers for streaming requests.
+        // If onRequestHead rewrote Content-Length / Transfer-Encoding, ensure we still
+        // send a self-consistent request upstream.
+        const streamingRequest: HttpHookRequest = {
+          method: state.hookRequest.method,
+          url: state.hookRequest.url,
+          headers: Object.fromEntries(
+            Object.entries(state.hookRequest.headers).map(([key, value]) => [key.toLowerCase(), value])
+          ),
+          body: null,
+        };
+
+        const expectedLength = contentLength.toString();
+        const hookedLength = streamingRequest.headers["content-length"];
+        if (hookedLength !== undefined && hookedLength !== expectedLength && this.options.debug) {
+          this.emitDebug(
+            `http bridge onRequestHead rewrote content-length (${hookedLength} -> ${expectedLength}); overriding for streaming`
+          );
+        }
+
+        delete streamingRequest.headers["transfer-encoding"];
+        streamingRequest.headers["content-length"] = expectedLength;
+
+        const safeWrite = (chunk: Buffer) => {
+          if (httpSession.closed) return;
+          options.write(chunk);
+        };
+
+        (async () => {
+          try {
+            releaseHttpConcurrency = await this.httpConcurrency.acquire();
+            await this.fetchHookRequestAndRespond({
+              request: streamingRequest,
+              httpVersion,
+              write: safeWrite,
+              waitForWritable: options.waitForWritable,
+              hooksAppliedFirstHop: true,
+              policyCheckedFirstHop: true,
+              enableBodyHook: false,
+              initialBodyStream: bodyStream as any,
+              initialBodyStreamHasBody: true,
+            });
+          } catch (err) {
+            const error = err instanceof Error ? err : new Error(String(err));
+            if (error instanceof HttpRequestBlockedError) {
+              if (this.options.debug) {
+                this.emitDebug(`http blocked ${error.message}`);
+              }
+              this.respondWithError(safeWrite, error.status, error.statusText, httpVersion);
+            } else {
+              this.emit("error", error);
+              this.respondWithError(safeWrite, 502, "Bad Gateway", httpVersion);
+            }
+          } finally {
+            releaseHttpConcurrency?.();
+            httpSession.processing = false;
+            if (!httpSession.closed) {
+              httpSession.closed = true;
+              options.finish();
+              this.flush();
+            }
+          }
+        })();
+
+        // Feed initial bytes into the stream.
+        if (initialBody.length > 0) {
+          await this.handleHttpDataWithWriter(key, session, initialBody, options);
+        }
+
+        return;
+      }
+
+      // If we know exactly how much body to expect, avoid attempting fetch until complete.
+      if (bufferedBodyBytes < contentLength) {
+        this.maybeSend100ContinueFromHead(httpSession, state, bufferedBodyBytes, options.write);
+        return;
+      }
+
+      // Body is fully buffered (or empty).
+      const full = httpSession.buffer.toBuffer();
+      const body =
+        contentLength > 0
+          ? full.subarray(state.bodyOffset, state.bodyOffset + contentLength)
+          : Buffer.alloc(0);
+      const remainingStart = state.bodyOffset + contentLength;
+
+      if (full.length - remainingStart > MAX_HTTP_PIPELINE_BYTES) {
+        throw new HttpRequestBlockedError(
+          `request pipeline exceeds ${MAX_HTTP_PIPELINE_BYTES} bytes`,
+          413,
+          "Payload Too Large"
+        );
+      }
+
+      const remaining = full.subarray(remainingStart);
+      httpSession.buffer.resetTo(Buffer.from(remaining));
+
+      const baseHookRequest = state.hookRequestForBodyHook ?? state.hookRequest;
+      let hookRequest: HttpHookRequest = {
+        method: baseHookRequest.method,
+        url: baseHookRequest.url,
+        headers: { ...baseHookRequest.headers },
+        body: body.length > 0 ? Buffer.from(body) : null,
+      };
+
+      if (state.bufferRequestBody) {
+        hookRequest = await this.applyRequestBodyHooks(hookRequest);
+      }
+
+      // Normalize framing headers for fetch.
+      hookRequest.headers = { ...hookRequest.headers };
+      delete hookRequest.headers["transfer-encoding"];
+      if (hookRequest.body) {
+        hookRequest.headers["content-length"] = hookRequest.body.length.toString();
+      } else {
+        delete hookRequest.headers["content-length"];
+      }
+
+      // If the buffered onRequest hook rewrote the destination or relevant headers,
+      // re-run request/ip policy checks against the final request.
+      if (state.bufferRequestBody && !this.isSamePolicyRelevantRequestHead(hookRequest, state.hookRequest)) {
+        let parsedUrl: URL;
+        try {
+          parsedUrl = new URL(hookRequest.url);
+        } catch {
+          throw new HttpRequestBlockedError("invalid url", 400, "Bad Request");
+        }
+
+        const protocol = getUrlProtocol(parsedUrl);
+        if (!protocol) {
+          throw new HttpRequestBlockedError("unsupported protocol", 400, "Bad Request");
+        }
+
+        const port = getUrlPort(parsedUrl, protocol);
+        if (!Number.isFinite(port) || port <= 0) {
+          throw new HttpRequestBlockedError("invalid port", 400, "Bad Request");
+        }
+
+        await this.ensureRequestAllowed(hookRequest);
+        await this.ensureIpAllowed(parsedUrl, protocol, port);
+      }
+
+      httpSession.processing = true;
+      let releaseHttpConcurrency: (() => void) | null = null;
+
+      try {
+        releaseHttpConcurrency = await this.httpConcurrency.acquire();
+        await this.fetchHookRequestAndRespond({
+          request: hookRequest,
+          httpVersion,
+          write: options.write,
+          waitForWritable: options.waitForWritable,
+          hooksAppliedFirstHop: true,
+          policyCheckedFirstHop: true,
+          enableBodyHook: state.bufferRequestBody,
+        });
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+
+        if (error instanceof HttpRequestBlockedError) {
+          if (this.options.debug) {
+            this.emitDebug(`http blocked ${error.message}`);
+          }
+          this.respondWithError(options.write, error.status, error.statusText, httpVersion);
+        } else {
+          this.emit("error", error);
+          this.respondWithError(options.write, 502, "Bad Gateway", httpVersion);
+        }
+      } finally {
+        releaseHttpConcurrency?.();
+        httpSession.processing = false;
+        if (!httpSession.closed) {
+          httpSession.closed = true;
+          options.finish();
+          this.flush();
+        }
+      }
+
+      return;
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
+      const version: "HTTP/1.0" | "HTTP/1.1" =
+        httpSession.head?.version === "HTTP/1.0" ? "HTTP/1.0" : "HTTP/1.1";
 
       if (error instanceof HttpRequestBlockedError) {
         if (this.options.debug) {
           this.emitDebug(`http blocked ${error.message}`);
         }
-        this.respondWithError(options.write, error.status, error.statusText, httpVersion);
+        this.respondWithError(options.write, error.status, error.statusText, version);
       } else {
         this.emit("error", error);
-        this.respondWithError(options.write, 502, "Bad Gateway", httpVersion);
+        this.respondWithError(options.write, 400, "Bad Request", version);
       }
 
-      // Failed websocket upgrades should not leave the session in websocket mode.
-      if (session.ws) {
-        session.ws = undefined;
-        if (session.socket) {
-          try {
-            session.socket.destroy();
-          } catch {
-            // ignore
-          }
-          session.socket = null;
-          session.connected = false;
+      // Abort any active upstream body stream.
+      if (httpSession.streamingBody) {
+        const controller = httpSession.streamingBody.controller;
+        try {
+          controller?.error(error);
+        } catch {
+          // ignore
         }
+        httpSession.streamingBody.done = true;
+        httpSession.streamingBody.controller = null;
+        this.updateQemuRxPauseState();
       }
-    } finally {
-      releaseHttpConcurrency?.();
-      httpSession.processing = false;
 
-      if (!keepOpen) {
-        httpSession.closed = true;
-        options.finish();
-        this.flush();
-      }
+      httpSession.closed = true;
+      options.finish();
+      this.flush();
     }
   }
 
@@ -3321,6 +3908,352 @@ export class QemuNetworkBackend extends EventEmitter {
     }
   }
 
+  private async fetchHookRequestAndRespond(options: {
+    request: HttpHookRequest;
+    httpVersion: "HTTP/1.0" | "HTTP/1.1";
+    write: (chunk: Buffer) => void;
+    waitForWritable?: () => Promise<void>;
+
+    /** whether onRequestHead/onRequest have already been applied to the initial request */
+    hooksAppliedFirstHop?: boolean;
+
+    /** whether request policy + IP policy have already been evaluated for the first hop */
+    policyCheckedFirstHop?: boolean;
+
+    /** whether to run httpHooks.onRequest (buffered body rewrite hook) */
+    enableBodyHook: boolean;
+
+    /** optional streaming request body for the initial hop */
+    initialBodyStream?: WebReadableStream<Uint8Array> | null;
+
+    /** whether the initial body stream carries a request body */
+    initialBodyStreamHasBody?: boolean;
+  }) {
+    const {
+      request: initialRequest,
+      httpVersion,
+      write,
+      waitForWritable,
+      hooksAppliedFirstHop = false,
+      policyCheckedFirstHop = false,
+      enableBodyHook,
+      initialBodyStream = null,
+      initialBodyStreamHasBody = Boolean(initialBodyStream),
+    } = options;
+
+    const fetcher = this.options.fetch ?? undiciFetch;
+
+    let pendingRequest: HttpHookRequest = initialRequest;
+
+    for (let redirectCount = 0; redirectCount <= MAX_HTTP_REDIRECTS; redirectCount += 1) {
+      const isFirstHop = redirectCount === 0;
+
+      let currentRequest = pendingRequest;
+      if (!(isFirstHop && hooksAppliedFirstHop)) {
+        const headResult = await this.applyRequestHeadHooks({
+          method: currentRequest.method,
+          url: currentRequest.url,
+          headers: currentRequest.headers,
+          body: null,
+        });
+
+        const baseForBodyHook = headResult.requestForBodyHook ?? headResult.request;
+        const headForThisHop = enableBodyHook ? baseForBodyHook : headResult.request;
+
+        currentRequest = {
+          method: headForThisHop.method,
+          url: headForThisHop.url,
+          headers: headForThisHop.headers,
+          body: currentRequest.body,
+        };
+
+        if (enableBodyHook) {
+          currentRequest = await this.applyRequestBodyHooks(currentRequest);
+        }
+      }
+
+      if (this.options.debug) {
+        this.emitDebug(`http bridge ${currentRequest.method} ${currentRequest.url}`);
+      }
+
+      let currentUrl: URL;
+      try {
+        currentUrl = new URL(currentRequest.url);
+      } catch {
+        this.respondWithError(write, 400, "Bad Request", httpVersion);
+        return;
+      }
+
+      const protocol = getUrlProtocol(currentUrl);
+      if (!protocol) {
+        this.respondWithError(write, 400, "Bad Request", httpVersion);
+        return;
+      }
+
+      const port = getUrlPort(currentUrl, protocol);
+      if (!Number.isFinite(port) || port <= 0) {
+        this.respondWithError(write, 400, "Bad Request", httpVersion);
+        return;
+      }
+
+      const requestLabel = `${currentRequest.method} ${currentUrl.toString()}`;
+      const responseStart = Date.now();
+
+      if (!(isFirstHop && policyCheckedFirstHop)) {
+        await this.ensureRequestAllowed(currentRequest);
+        await this.ensureIpAllowed(currentUrl, protocol, port);
+      }
+
+      const useDefaultFetch = this.options.fetch === undefined;
+      const dispatcher = useDefaultFetch
+        ? this.getCheckedDispatcher({
+            hostname: currentUrl.hostname,
+            port,
+            protocol,
+          })
+        : null;
+
+      const streamBodyThisHop =
+        isFirstHop && initialBodyStream && initialBodyStreamHasBody ? initialBodyStream : null;
+
+      const bodyInit = streamBodyThisHop
+        ? streamBodyThisHop
+        : currentRequest.body
+          ? new Uint8Array(currentRequest.body)
+          : undefined;
+
+      let response: FetchResponse;
+      try {
+        response = await fetcher(currentUrl.toString(), {
+          method: currentRequest.method,
+          headers: currentRequest.headers,
+          body: bodyInit as any,
+          redirect: "manual",
+          ...(streamBodyThisHop ? { duplex: "half" } : {}),
+          ...(dispatcher ? { dispatcher } : {}),
+        } as any);
+      } catch (err) {
+        if (this.options.debug) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.emitDebug(
+            `http bridge fetch failed ${currentRequest.method} ${currentUrl.toString()} (${message})`
+          );
+        }
+        throw err;
+      }
+
+      const redirectUrl = getRedirectUrl(response, currentUrl);
+      if (redirectUrl) {
+        if (response.body) {
+          await response.body.cancel();
+        }
+
+        if (redirectCount >= MAX_HTTP_REDIRECTS) {
+          throw new HttpRequestBlockedError("too many redirects", 508, "Loop Detected");
+        }
+
+        if (streamBodyThisHop) {
+          // Streaming request bodies cannot be replayed on redirects.
+          const redirected = applyRedirectRequest(
+            {
+              method: currentRequest.method,
+              url: currentRequest.url,
+              headers: currentRequest.headers,
+              // Sentinel to indicate a non-empty body so redirect rewriting matches buffered semantics.
+              body: Buffer.alloc(1),
+            },
+            response.status,
+            currentUrl,
+            redirectUrl
+          );
+
+          if (redirected.body) {
+            throw new HttpRequestBlockedError(
+              "redirect requires replaying streamed request body",
+              502,
+              "Bad Gateway"
+            );
+          }
+
+          pendingRequest = {
+            method: redirected.method,
+            url: redirected.url,
+            headers: redirected.headers,
+            body: null,
+          };
+          continue;
+        }
+
+        pendingRequest = applyRedirectRequest(currentRequest, response.status, currentUrl, redirectUrl);
+        continue;
+      }
+
+      if (this.options.debug) {
+        this.emitDebug(`http bridge response ${response.status} ${response.statusText}`);
+      }
+
+      let responseHeaders = this.stripHopByHopHeaders(this.headersToRecord(response.headers));
+      const contentEncodingValue = responseHeaders["content-encoding"];
+      const contentEncoding = Array.isArray(contentEncodingValue)
+        ? contentEncodingValue[0]
+        : contentEncodingValue;
+
+      const contentLengthValue = responseHeaders["content-length"];
+      const contentLength = Array.isArray(contentLengthValue)
+        ? contentLengthValue[0]
+        : contentLengthValue;
+
+      const parsedLength = contentLength ? Number(contentLength) : null;
+      const hasValidLength = parsedLength !== null && Number.isFinite(parsedLength) && parsedLength >= 0;
+
+      if (contentEncoding) {
+        delete responseHeaders["content-encoding"];
+        delete responseHeaders["content-length"];
+      }
+      responseHeaders["connection"] = "close";
+
+      const responseBodyStream = response.body as WebReadableStream<Uint8Array> | null;
+
+      const suppressBody =
+        currentRequest.method === "HEAD" || response.status === 204 || response.status === 304;
+
+      if (suppressBody) {
+        if (responseBodyStream) {
+          try {
+            await responseBodyStream.cancel();
+          } catch {
+            // ignore cancellation failures
+          }
+        }
+
+        // No message body is allowed for these responses.
+        delete responseHeaders["transfer-encoding"];
+
+        if (response.status === 204 || response.status === 304) {
+          delete responseHeaders["content-encoding"];
+          responseHeaders["content-length"] = "0";
+        } else {
+          // HEAD: preserve Content-Length if present, otherwise be explicit.
+          if (!responseHeaders["content-length"]) responseHeaders["content-length"] = "0";
+        }
+
+        let hookResponse: HttpHookResponse = {
+          status: response.status,
+          statusText: response.statusText || "OK",
+          headers: responseHeaders,
+          body: Buffer.alloc(0),
+        };
+
+        if (this.options.httpHooks?.onResponse) {
+          const updated = await this.options.httpHooks.onResponse(hookResponse, currentRequest);
+          if (updated) hookResponse = updated;
+        }
+
+        this.sendHttpResponse(write, hookResponse, httpVersion);
+        return;
+      }
+
+      const canStream = Boolean(responseBodyStream) && !this.options.httpHooks?.onResponse;
+
+      if (canStream && responseBodyStream) {
+        const allowChunked = httpVersion === "HTTP/1.1";
+        let streamedBytes = 0;
+
+        if (contentEncoding || !hasValidLength) {
+          delete responseHeaders["content-length"];
+
+          if (allowChunked) {
+            responseHeaders["transfer-encoding"] = "chunked";
+            this.sendHttpResponseHead(
+              write,
+              {
+                status: response.status,
+                statusText: response.statusText || "OK",
+                headers: responseHeaders,
+              },
+              httpVersion
+            );
+            streamedBytes = await this.sendChunkedBody(responseBodyStream, write, waitForWritable);
+          } else {
+            delete responseHeaders["transfer-encoding"];
+            this.sendHttpResponseHead(
+              write,
+              {
+                status: response.status,
+                statusText: response.statusText || "OK",
+                headers: responseHeaders,
+              },
+              httpVersion
+            );
+            streamedBytes = await this.sendStreamBody(responseBodyStream, write, waitForWritable);
+          }
+        } else {
+          responseHeaders["content-length"] = parsedLength!.toString();
+          delete responseHeaders["transfer-encoding"];
+          this.sendHttpResponseHead(
+            write,
+            {
+              status: response.status,
+              statusText: response.statusText || "OK",
+              headers: responseHeaders,
+            },
+            httpVersion
+          );
+          streamedBytes = await this.sendStreamBody(responseBodyStream, write, waitForWritable);
+        }
+
+        if (this.options.debug) {
+          const elapsed = Date.now() - responseStart;
+          this.emitDebug(`http bridge body complete ${requestLabel} ${streamedBytes} bytes in ${elapsed}ms`);
+        }
+
+        return;
+      }
+
+      const maxResponseBytes = this.maxHttpResponseBodyBytes;
+
+      if (hasValidLength && !contentEncoding && parsedLength! > maxResponseBytes) {
+        if (responseBodyStream) {
+          try {
+            await responseBodyStream.cancel();
+          } catch {
+            // ignore cancellation failures
+          }
+        }
+        throw new HttpRequestBlockedError(`response body exceeds ${maxResponseBytes} bytes`, 502, "Bad Gateway");
+      }
+
+      const responseBody = responseBodyStream
+        ? await this.bufferResponseBodyWithLimit(responseBodyStream, maxResponseBytes)
+        : Buffer.from(await response.arrayBuffer());
+
+      if (responseBody.length > maxResponseBytes) {
+        throw new HttpRequestBlockedError(`response body exceeds ${maxResponseBytes} bytes`, 502, "Bad Gateway");
+      }
+
+      responseHeaders["content-length"] = responseBody.length.toString();
+
+      let hookResponse: HttpHookResponse = {
+        status: response.status,
+        statusText: response.statusText || "OK",
+        headers: responseHeaders,
+        body: responseBody,
+      };
+
+      if (this.options.httpHooks?.onResponse) {
+        const updated = await this.options.httpHooks.onResponse(hookResponse, currentRequest);
+        if (updated) hookResponse = updated;
+      }
+
+      this.sendHttpResponse(write, hookResponse, httpVersion);
+      if (this.options.debug) {
+        const elapsed = Date.now() - responseStart;
+        this.emitDebug(`http bridge body complete ${requestLabel} ${hookResponse.body.length} bytes in ${elapsed}ms`);
+      }
+      return;
+    }
+  }
+
   private async fetchAndRespond(
     request: HttpRequestData,
     defaultScheme: "http" | "https",
@@ -3360,276 +4293,21 @@ export class QemuNetworkBackend extends EventEmitter {
       return;
     }
 
-    // XXX: validate URL + DNS/IP to block localhost/private ranges before fetch().
-    if (this.options.debug) {
-      this.emitDebug(`http bridge ${request.method} ${url}`);
-    }
-
-    let hookRequest: HttpHookRequest = {
+    const hookRequest: HttpHookRequest = {
       method: request.method,
       url,
       headers: this.stripHopByHopHeaders(request.headers),
       body: request.body.length > 0 ? request.body : null,
     };
 
-    const fetcher = this.options.fetch ?? undiciFetch;
-    let pendingRequest = hookRequest;
-
-    for (let redirectCount = 0; redirectCount <= MAX_HTTP_REDIRECTS; redirectCount += 1) {
-      const currentRequest = await this.applyRequestHooks(pendingRequest);
-
-      let currentUrl: URL;
-      try {
-        currentUrl = new URL(currentRequest.url);
-      } catch {
-        this.respondWithError(write, 400, "Bad Request", httpVersion);
-        return;
-      }
-
-      const protocol = getUrlProtocol(currentUrl);
-      if (!protocol) {
-        this.respondWithError(write, 400, "Bad Request", httpVersion);
-        return;
-      }
-
-      const port = getUrlPort(currentUrl, protocol);
-      if (!Number.isFinite(port) || port <= 0) {
-        this.respondWithError(write, 400, "Bad Request", httpVersion);
-        return;
-      }
-
-      const requestLabel = `${currentRequest.method} ${currentUrl.toString()}`;
-      const responseStart = Date.now();
-
-      await this.ensureRequestAllowed(currentRequest);
-      await this.ensureIpAllowed(currentUrl, protocol, port);
-
-      const useDefaultFetch = this.options.fetch === undefined;
-      // The shared dispatcher re-checks IP policy whenever it opens
-      // new upstream connections.
-      const dispatcher = useDefaultFetch
-        ? this.getCheckedDispatcher({
-            hostname: currentUrl.hostname,
-            port,
-            protocol,
-          })
-        : null;
-
-      let response: FetchResponse;
-      try {
-        response = await fetcher(currentUrl.toString(), {
-          method: currentRequest.method,
-          headers: currentRequest.headers,
-          body: currentRequest.body ? new Uint8Array(currentRequest.body) : undefined,
-          redirect: "manual",
-          ...(dispatcher ? { dispatcher } : {}),
-        });
-      } catch (err) {
-        if (this.options.debug) {
-          const message = err instanceof Error ? err.message : String(err);
-          this.emitDebug(`http bridge fetch failed ${currentRequest.method} ${currentUrl.toString()} (${message})`);
-        }
-        throw err;
-      }
-
-      const redirectUrl = getRedirectUrl(response, currentUrl);
-        if (redirectUrl) {
-          if (response.body) {
-            await response.body.cancel();
-          }
-
-          if (redirectCount >= MAX_HTTP_REDIRECTS) {
-            throw new HttpRequestBlockedError("too many redirects", 508, "Loop Detected");
-          }
-
-          pendingRequest = applyRedirectRequest(
-            currentRequest,
-            response.status,
-            currentUrl,
-            redirectUrl
-          );
-          continue;
-        }
-
-        if (this.options.debug) {
-          this.emitDebug(`http bridge response ${response.status} ${response.statusText}`);
-        }
-
-        let responseHeaders = this.stripHopByHopHeaders(this.headersToRecord(response.headers));
-        const contentEncodingValue = responseHeaders["content-encoding"];
-        const contentEncoding = Array.isArray(contentEncodingValue)
-          ? contentEncodingValue[0]
-          : contentEncodingValue;
-
-        const contentLengthValue = responseHeaders["content-length"];
-        const contentLength = Array.isArray(contentLengthValue)
-          ? contentLengthValue[0]
-          : contentLengthValue;
-
-        const parsedLength = contentLength ? Number(contentLength) : null;
-        const hasValidLength =
-          parsedLength !== null && Number.isFinite(parsedLength) && parsedLength >= 0;
-
-        if (contentEncoding) {
-          delete responseHeaders["content-encoding"];
-          delete responseHeaders["content-length"];
-        }
-        responseHeaders["connection"] = "close";
-
-        const responseBodyStream = response.body as WebReadableStream<Uint8Array> | null;
-
-        const suppressBody =
-          currentRequest.method === "HEAD" || response.status === 204 || response.status === 304;
-
-        if (suppressBody) {
-          if (responseBodyStream) {
-            try {
-              await responseBodyStream.cancel();
-            } catch {
-              // ignore cancellation failures
-            }
-          }
-
-          // No message body is allowed for these responses.
-          delete responseHeaders["transfer-encoding"];
-
-          if (response.status === 204 || response.status === 304) {
-            delete responseHeaders["content-encoding"];
-            responseHeaders["content-length"] = "0";
-          } else {
-            // HEAD: preserve Content-Length if present, otherwise be explicit.
-            if (!responseHeaders["content-length"]) responseHeaders["content-length"] = "0";
-          }
-
-          let hookResponse: HttpHookResponse = {
-            status: response.status,
-            statusText: response.statusText || "OK",
-            headers: responseHeaders,
-            body: Buffer.alloc(0),
-          };
-
-          if (this.options.httpHooks?.onResponse) {
-            const updated = await this.options.httpHooks.onResponse(hookResponse, currentRequest);
-            if (updated) hookResponse = updated;
-          }
-
-          this.sendHttpResponse(write, hookResponse, httpVersion);
-          return;
-        }
-
-        const canStream = Boolean(responseBodyStream) && !this.options.httpHooks?.onResponse;
-
-        if (canStream && responseBodyStream) {
-          const allowChunked = httpVersion === "HTTP/1.1";
-          let streamedBytes = 0;
-
-          if (contentEncoding || !hasValidLength) {
-            // When the upstream response was encoded (undici may have decoded it for us)
-            // or the length is unknown, we cannot safely forward Content-Length.
-            delete responseHeaders["content-length"];
-
-            if (allowChunked) {
-              responseHeaders["transfer-encoding"] = "chunked";
-              this.sendHttpResponseHead(
-                write,
-                {
-                  status: response.status,
-                  statusText: response.statusText || "OK",
-                  headers: responseHeaders,
-                },
-                httpVersion
-              );
-              streamedBytes = await this.sendChunkedBody(responseBodyStream, write, waitForWritable);
-            } else {
-              // HTTP/1.0 does not support Transfer-Encoding: chunked.
-              delete responseHeaders["transfer-encoding"];
-              this.sendHttpResponseHead(
-                write,
-                {
-                  status: response.status,
-                  statusText: response.statusText || "OK",
-                  headers: responseHeaders,
-                },
-                httpVersion
-              );
-              streamedBytes = await this.sendStreamBody(responseBodyStream, write, waitForWritable);
-            }
-          } else {
-            responseHeaders["content-length"] = parsedLength!.toString();
-            delete responseHeaders["transfer-encoding"];
-            this.sendHttpResponseHead(
-              write,
-              {
-                status: response.status,
-                statusText: response.statusText || "OK",
-                headers: responseHeaders,
-              },
-              httpVersion
-            );
-            streamedBytes = await this.sendStreamBody(responseBodyStream, write, waitForWritable);
-          }
-
-          if (this.options.debug) {
-            const elapsed = Date.now() - responseStart;
-            this.emitDebug(`http bridge body complete ${requestLabel} ${streamedBytes} bytes in ${elapsed}ms`);
-          }
-
-          return;
-        }
-
-        const maxResponseBytes = this.maxHttpResponseBodyBytes;
-
-        // Fast-path rejection when the upstream response declares a length that
-        // is already beyond what we're willing to buffer.
-        if (hasValidLength && !contentEncoding && parsedLength! > maxResponseBytes) {
-          if (responseBodyStream) {
-            try {
-              await responseBodyStream.cancel();
-            } catch {
-              // ignore cancellation failures
-            }
-          }
-          throw new HttpRequestBlockedError(
-            `response body exceeds ${maxResponseBytes} bytes`,
-            502,
-            "Bad Gateway"
-          );
-        }
-
-        const responseBody = responseBodyStream
-          ? await this.bufferResponseBodyWithLimit(responseBodyStream, maxResponseBytes)
-          : Buffer.from(await response.arrayBuffer());
-
-        if (responseBody.length > maxResponseBytes) {
-          throw new HttpRequestBlockedError(
-            `response body exceeds ${maxResponseBytes} bytes`,
-            502,
-            "Bad Gateway"
-          );
-        }
-
-        responseHeaders["content-length"] = responseBody.length.toString();
-
-        let hookResponse: HttpHookResponse = {
-          status: response.status,
-          statusText: response.statusText || "OK",
-          headers: responseHeaders,
-          body: responseBody,
-        };
-
-        if (this.options.httpHooks?.onResponse) {
-          const updated = await this.options.httpHooks.onResponse(hookResponse, currentRequest);
-          if (updated) hookResponse = updated;
-        }
-
-        this.sendHttpResponse(write, hookResponse, httpVersion);
-        if (this.options.debug) {
-          const elapsed = Date.now() - responseStart;
-          this.emitDebug(`http bridge body complete ${requestLabel} ${hookResponse.body.length} bytes in ${elapsed}ms`);
-        }
-        return;
-    }
-
+    await this.fetchHookRequestAndRespond({
+      request: hookRequest,
+      httpVersion,
+      write,
+      waitForWritable,
+      hooksAppliedFirstHop: false,
+      enableBodyHook: true,
+    });
   }
 
   private isWebSocketUpgradeRequest(request: HttpRequestData): boolean {
@@ -3689,8 +4367,14 @@ export class QemuNetworkBackend extends EventEmitter {
     request: HttpRequestData,
     session: TcpSession,
     options: { scheme: "http" | "https"; write: (chunk: Buffer) => void; finish: () => void },
-    httpVersion: "HTTP/1.0" | "HTTP/1.1"
-  ): Promise<boolean> {
+    httpVersion: "HTTP/1.0" | "HTTP/1.1",
+    hookContext: {
+      /** head after `onRequestHead` (and secret substitution) */
+      headHookRequest: HttpHookRequest;
+      /** placeholder-only head to feed into `onRequest` */
+      headHookRequestForBodyHook: HttpHookRequest | null;
+    }
+  ): Promise<boolean> { 
     if (request.version !== "HTTP/1.1") {
       throw new HttpRequestBlockedError("websocket upgrade requires HTTP/1.1", 501, "Not Implemented");
     }
@@ -3703,19 +4387,27 @@ export class QemuNetworkBackend extends EventEmitter {
       throw new HttpRequestBlockedError("websocket upgrade requests must not have a body", 400, "Bad Request");
     }
 
-    const url = this.buildFetchUrl(request, options.scheme);
-    if (!url) {
-      throw new HttpRequestBlockedError("missing host", 400, "Bad Request");
-    }
+    const { headHookRequest, headHookRequestForBodyHook } = hookContext;
 
+    // `handleHttpDataWithWriter` already ran `onRequestHead` (and the associated
+    // policy checks) for this request. Avoid running it again here (duplicate
+    // side effects + policy mismatches).
     let hookRequest: HttpHookRequest = {
-      method: "GET",
-      url,
-      headers: this.stripHopByHopHeadersForWebSocket(request.headers),
+      method: headHookRequest.method,
+      url: headHookRequest.url,
+      headers: { ...headHookRequest.headers },
       body: null,
     };
 
-    hookRequest = await this.applyRequestHooks(hookRequest);
+    // Preserve placeholder-only values for `onRequest` (per secrets docs). The
+    // `createHttpHooks` wrapper will inject secrets after the user hook runs.
+    hookRequest = await this.applyRequestBodyHooks(headHookRequestForBodyHook ?? hookRequest);
+
+    // If `onRequest` rewrote the destination or relevant headers, re-run request
+    // policy checks against the final (post-rewrite) request.
+    if (!this.isSamePolicyRelevantRequestHead(hookRequest, headHookRequest)) {
+      await this.ensureRequestAllowed(hookRequest);
+    }
 
     const method = (hookRequest.method ?? "GET").toUpperCase();
     if (method !== "GET") {
@@ -4378,7 +5070,16 @@ export class QemuNetworkBackend extends EventEmitter {
 
   private async ensureRequestAllowed(request: HttpHookRequest) {
     if (!this.options.httpHooks?.isRequestAllowed) return;
-    const allowed = await this.options.httpHooks.isRequestAllowed(request);
+
+    // Request policy is head-only: never expose request body to this callback.
+    const headOnly: HttpHookRequest = {
+      method: request.method,
+      url: request.url,
+      headers: request.headers,
+      body: null,
+    };
+
+    const allowed = await this.options.httpHooks.isRequestAllowed(headOnly);
     if (!allowed) {
       throw new HttpRequestBlockedError("blocked by request policy");
     }
@@ -4393,16 +5094,99 @@ export class QemuNetworkBackend extends EventEmitter {
     await this.resolveHostname(parsedUrl.hostname, { protocol, port });
   }
 
-  private async applyRequestHooks(request: HttpHookRequest): Promise<HttpHookRequest> {
+  private isSamePolicyRelevantRequestHead(a: HttpHookRequest, b: HttpHookRequest): boolean {
+    if (a.method !== b.method) return false;
+    if (a.url !== b.url) return false;
+
+    const normalize = (headers: Record<string, string>) => {
+      const out: Record<string, string> = {};
+      for (const [key, value] of Object.entries(headers)) {
+        const lower = key.toLowerCase();
+        // These are framing headers that the bridge may normalize between the
+        // head parsing step and the eventual fetch.
+        if (lower === "content-length" || lower === "transfer-encoding") continue;
+        out[lower] = value;
+      }
+      return out;
+    };
+
+    const ah = normalize(a.headers);
+    const bh = normalize(b.headers);
+    const aKeys = Object.keys(ah);
+    const bKeys = Object.keys(bh);
+    if (aKeys.length !== bKeys.length) return false;
+
+    for (const key of aKeys) {
+      if (!(key in bh)) return false;
+      if (ah[key] !== bh[key]) return false;
+    }
+
+    return true;
+  }
+
+  private async applyRequestHeadHooks(request: HttpHookRequest): Promise<{
+    request: HttpHookRequest;
+    /** optional placeholder request head to feed into `httpHooks.onRequest` */
+    requestForBodyHook: HttpHookRequest | null;
+    bufferRequestBody: boolean;
+    maxBufferedRequestBodyBytes: number | null;
+  }> {
+    const hasBodyHook = Boolean(this.options.httpHooks?.onRequest);
+
+    if (!this.options.httpHooks?.onRequestHead) {
+      return {
+        request,
+        requestForBodyHook: null,
+        bufferRequestBody: hasBodyHook,
+        maxBufferedRequestBodyBytes: null,
+      };
+    }
+
+    const cloned: HttpHookRequest = {
+      method: request.method,
+      url: request.url,
+      headers: { ...request.headers },
+      body: null,
+    };
+
+    const updated = await this.options.httpHooks.onRequestHead(cloned);
+    const next = (updated ?? cloned) as HttpHookRequest & {
+      bufferRequestBody?: boolean;
+      maxBufferedRequestBodyBytes?: number;
+      requestForBodyHook?: HttpHookRequest;
+    };
+
+    return {
+      request: {
+        method: next.method,
+        url: next.url,
+        headers: next.headers,
+        body: null,
+      },
+      requestForBodyHook: next.requestForBodyHook ?? null,
+      bufferRequestBody:
+        typeof next.bufferRequestBody === "boolean" ? next.bufferRequestBody : hasBodyHook,
+      maxBufferedRequestBodyBytes:
+        typeof next.maxBufferedRequestBodyBytes === "number" &&
+        Number.isFinite(next.maxBufferedRequestBodyBytes) &&
+        next.maxBufferedRequestBodyBytes >= 0
+          ? next.maxBufferedRequestBodyBytes
+          : null,
+    };
+  }
+
+  private async applyRequestBodyHooks(request: HttpHookRequest): Promise<HttpHookRequest> {
     if (!this.options.httpHooks?.onRequest) {
       return request;
     }
+
     const cloned: HttpHookRequest = {
       method: request.method,
       url: request.url,
       headers: { ...request.headers },
       body: request.body,
     };
+
     const updated = await this.options.httpHooks.onRequest(cloned);
     return updated ?? cloned;
   }
