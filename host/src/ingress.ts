@@ -965,6 +965,221 @@ export class IngressGateway {
     return best;
   }
 
+  private async buildUpstreamHookRequest(
+    url: URL,
+    route: IngressRoute,
+    hooks: IngressGatewayHooks | null,
+    clientIp: string,
+    clientMethod: string,
+    incoming: Record<string, string | string[]>,
+    hostHeader: string,
+    forUpgrade: boolean,
+  ): Promise<{
+    hookRequest: IngressHookRequest;
+    bufferResponseBody: boolean;
+    maxBufferedResponseBodyBytes: number;
+  }> {
+    const path = url.pathname + url.search;
+
+    if (hooks?.isAllowed) {
+      const allowed = await hooks.isAllowed({
+        clientIp,
+        method: clientMethod,
+        path,
+        headers: incoming,
+        route,
+      });
+      if (!allowed) {
+        throw new IngressRequestBlockedError();
+      }
+    }
+
+    const backendPathname = route.stripPrefix
+      ? stripPrefix(url.pathname, route.prefix)
+      : url.pathname;
+
+    // Response buffering defaults (can be overridden per-request via onRequest)
+    let bufferResponseBody = this.bufferResponseBody;
+    let maxBufferedResponseBodyBytes = this.maxBufferedResponseBodyBytes;
+
+    const filterHeaders = forUpgrade
+      ? filterHopByHopForUpgrade
+      : filterHopByHop;
+
+    // Build initial upstream request config (can be patched by onRequest)
+    let hookRequest: IngressHookRequest = {
+      clientIp,
+      method: clientMethod,
+      path,
+      route,
+      backendHost: "127.0.0.1",
+      backendPort: route.port,
+      backendTarget: backendPathname + url.search,
+      headers: normalizeHeaderRecord(filterHeaders(incoming)),
+    };
+
+    // Remove body framing headers; we choose framing ourselves.
+    delete hookRequest.headers["content-length"];
+    delete hookRequest.headers["transfer-encoding"];
+    delete hookRequest.headers["expect"];
+
+    hookRequest.headers["host"] = hostHeader;
+    if (!forUpgrade) hookRequest.headers["connection"] = "close";
+
+    // Forwarded headers
+    if (clientIp) {
+      const prev = hookRequest.headers["x-forwarded-for"];
+      if (typeof prev === "string" && prev.length > 0) {
+        hookRequest.headers["x-forwarded-for"] = `${prev}, ${clientIp}`;
+      } else {
+        hookRequest.headers["x-forwarded-for"] = clientIp;
+      }
+    }
+    hookRequest.headers["x-forwarded-host"] = hostHeader;
+    hookRequest.headers["x-forwarded-proto"] = "http";
+    if (route.stripPrefix && route.prefix !== "/") {
+      hookRequest.headers["x-forwarded-prefix"] = route.prefix;
+    }
+
+    if (hooks?.onRequest) {
+      const patch = await hooks.onRequest(hookRequest);
+      if (patch) {
+        if (patch.method !== undefined) hookRequest.method = patch.method;
+        if (patch.backendHost !== undefined)
+          hookRequest.backendHost = patch.backendHost;
+        if (patch.backendPort !== undefined)
+          hookRequest.backendPort = patch.backendPort;
+        if (patch.backendTarget !== undefined)
+          hookRequest.backendTarget = patch.backendTarget;
+        if (patch.headers) {
+          hookRequest.headers = applyHeaderPatch(
+            hookRequest.headers,
+            patch.headers,
+          );
+        }
+        if (patch.bufferResponseBody !== undefined)
+          bufferResponseBody = patch.bufferResponseBody;
+        if (patch.maxBufferedResponseBodyBytes !== undefined) {
+          maxBufferedResponseBodyBytes = patch.maxBufferedResponseBodyBytes;
+        }
+      }
+    }
+
+    hookRequest.method = (hookRequest.method ?? "GET").toUpperCase();
+
+    if (forUpgrade && hookRequest.method !== "GET") {
+      return {
+        hookRequest,
+        bufferResponseBody,
+        maxBufferedResponseBodyBytes,
+      };
+    }
+
+    if (
+      hookRequest.backendHost !== "127.0.0.1" &&
+      hookRequest.backendHost !== "localhost"
+    ) {
+      throw new Error(
+        `invalid ingress backend host: ${hookRequest.backendHost}`,
+      );
+    }
+
+    if (
+      !Number.isInteger(hookRequest.backendPort) ||
+      hookRequest.backendPort <= 0 ||
+      hookRequest.backendPort > 65535
+    ) {
+      throw new Error(
+        `invalid ingress backend port: ${hookRequest.backendPort}`,
+      );
+    }
+
+    if (!hookRequest.backendTarget.startsWith("/")) {
+      throw new Error(
+        `invalid ingress backend target: ${hookRequest.backendTarget}`,
+      );
+    }
+
+    // Enforce hop-by-hop filtering after the user hook
+    hookRequest.headers = normalizeHeaderRecord(
+      filterHeaders(hookRequest.headers as any),
+    );
+
+    // Remove body framing headers; we choose framing ourselves.
+    delete hookRequest.headers["content-length"];
+    delete hookRequest.headers["transfer-encoding"];
+    delete hookRequest.headers["expect"];
+    if (!forUpgrade) hookRequest.headers["connection"] = "close";
+
+    return {
+      hookRequest,
+      bufferResponseBody,
+      maxBufferedResponseBodyBytes,
+    };
+  }
+
+  private async openUpstreamAndWriteHead(
+    hookRequest: IngressHookRequest,
+    options: {
+      extra?: Buffer;
+      onError?: (err: unknown) => void;
+    } = {},
+  ): Promise<Duplex> {
+    const upstream = await this.sandbox.openIngressStream({
+      host: hookRequest.backendHost,
+      port: hookRequest.backendPort,
+      timeoutMs: 2000,
+    });
+
+    if (options.onError) {
+      upstream.on("error", options.onError as any);
+    }
+
+    // Send request line + headers
+    const headerLines: string[] = [];
+    headerLines.push(
+      `${hookRequest.method} ${hookRequest.backendTarget} HTTP/1.1`,
+    );
+    for (const [k, v] of Object.entries(hookRequest.headers)) {
+      if (v === undefined) continue;
+      if (Array.isArray(v)) {
+        for (const vv of v) headerLines.push(`${k}: ${vv}`);
+      } else {
+        headerLines.push(`${k}: ${v}`);
+      }
+    }
+    const headerBlob = headerLines.join("\r\n") + "\r\n\r\n";
+
+    await writeStream(upstream, headerBlob);
+
+    if (options.extra && options.extra.length > 0) {
+      await writeStream(upstream, options.extra);
+    }
+
+    return upstream;
+  }
+
+  private rejectUpgrade(
+    socket: net.Socket,
+    statusCode: number,
+    statusMessage: string,
+    bodyText: string,
+  ) {
+    const body = Buffer.from(bodyText, "utf8");
+    this.writeRawHttpResponse(
+      socket,
+      statusCode,
+      statusMessage,
+      {
+        "content-type": "text/plain",
+        "content-length": String(body.length),
+        connection: "close",
+      },
+      body,
+    );
+    socket.destroy();
+  }
+
   private async handleRequest(
     req: IncomingMessage,
     res: ServerResponse,
@@ -991,129 +1206,22 @@ export class IngressGateway {
       const hooks = this.hooks;
       const clientIp = req.socket.remoteAddress ?? "";
       const clientMethod = (req.method ?? "GET").toUpperCase();
-      const path = url.pathname + url.search;
       const incoming = normalizeIncomingHeaders(req.headers);
-
-      if (hooks?.isAllowed) {
-        const allowed = await hooks.isAllowed({
-          clientIp,
-          method: clientMethod,
-          path,
-          headers: incoming,
-          route,
-        });
-        if (!allowed) {
-          throw new IngressRequestBlockedError();
-        }
-      }
-
-      // Rewrite path
-      const backendPathname = route.stripPrefix
-        ? stripPrefix(url.pathname, route.prefix)
-        : url.pathname;
-
-      // Response buffering defaults (can be overridden per-request via onRequest)
-      let bufferResponseBody = this.bufferResponseBody;
-      let maxBufferedResponseBodyBytes = this.maxBufferedResponseBodyBytes;
-
-      // Build initial upstream request config (can be patched by onRequest)
-      let hookRequest: IngressHookRequest = {
-        clientIp,
-        method: clientMethod,
-        path,
-        route,
-        backendHost: "127.0.0.1",
-        backendPort: route.port,
-        backendTarget: backendPathname + url.search,
-        headers: normalizeHeaderRecord(filterHopByHop(incoming)),
-      };
-
-      // Remove body framing headers; we choose framing ourselves.
-      delete hookRequest.headers["content-length"];
-      delete hookRequest.headers["transfer-encoding"];
-      delete hookRequest.headers["expect"];
 
       const hostHeader =
         typeof incoming["host"] === "string" ? incoming["host"] : "localhost";
-      hookRequest.headers["host"] = hostHeader;
-      hookRequest.headers["connection"] = "close";
 
-      // Forwarded headers
-      if (clientIp) {
-        const prev = hookRequest.headers["x-forwarded-for"];
-        if (typeof prev === "string" && prev.length > 0) {
-          hookRequest.headers["x-forwarded-for"] = `${prev}, ${clientIp}`;
-        } else {
-          hookRequest.headers["x-forwarded-for"] = clientIp;
-        }
-      }
-      hookRequest.headers["x-forwarded-host"] = hostHeader;
-      hookRequest.headers["x-forwarded-proto"] = "http";
-      if (route.stripPrefix && route.prefix !== "/") {
-        hookRequest.headers["x-forwarded-prefix"] = route.prefix;
-      }
-
-      if (hooks?.onRequest) {
-        const patch = await hooks.onRequest(hookRequest);
-        if (patch) {
-          if (patch.method !== undefined) hookRequest.method = patch.method;
-          if (patch.backendHost !== undefined)
-            hookRequest.backendHost = patch.backendHost;
-          if (patch.backendPort !== undefined)
-            hookRequest.backendPort = patch.backendPort;
-          if (patch.backendTarget !== undefined)
-            hookRequest.backendTarget = patch.backendTarget;
-          if (patch.headers) {
-            hookRequest.headers = applyHeaderPatch(
-              hookRequest.headers,
-              patch.headers,
-            );
-          }
-          if (patch.bufferResponseBody !== undefined)
-            bufferResponseBody = patch.bufferResponseBody;
-          if (patch.maxBufferedResponseBodyBytes !== undefined) {
-            maxBufferedResponseBodyBytes = patch.maxBufferedResponseBodyBytes;
-          }
-        }
-      }
-
-      hookRequest.method = (hookRequest.method ?? "GET").toUpperCase();
-
-      if (
-        hookRequest.backendHost !== "127.0.0.1" &&
-        hookRequest.backendHost !== "localhost"
-      ) {
-        throw new Error(
-          `invalid ingress backend host: ${hookRequest.backendHost}`,
+      const { hookRequest, bufferResponseBody, maxBufferedResponseBodyBytes } =
+        await this.buildUpstreamHookRequest(
+          url,
+          route,
+          hooks,
+          clientIp,
+          clientMethod,
+          incoming,
+          hostHeader,
+          false,
         );
-      }
-
-      if (
-        !Number.isInteger(hookRequest.backendPort) ||
-        hookRequest.backendPort <= 0 ||
-        hookRequest.backendPort > 65535
-      ) {
-        throw new Error(
-          `invalid ingress backend port: ${hookRequest.backendPort}`,
-        );
-      }
-
-      if (!hookRequest.backendTarget.startsWith("/")) {
-        throw new Error(
-          `invalid ingress backend target: ${hookRequest.backendTarget}`,
-        );
-      }
-
-      // Enforce hop-by-hop filtering after the user hook
-      hookRequest.headers = normalizeHeaderRecord(
-        filterHopByHop(hookRequest.headers as any),
-      );
-
-      // Remove body framing headers; we choose framing ourselves.
-      delete hookRequest.headers["content-length"];
-      delete hookRequest.headers["transfer-encoding"];
-      delete hookRequest.headers["expect"];
-      hookRequest.headers["connection"] = "close";
 
       // Decide request body encoding (based on what we received from the client)
       const hasBody =
@@ -1143,29 +1251,9 @@ export class IngressGateway {
         hookRequest.headers["transfer-encoding"] = "chunked";
       }
 
-      upstream = await this.sandbox.openIngressStream({
-        host: hookRequest.backendHost,
-        port: hookRequest.backendPort,
-        timeoutMs: 2000,
+      upstream = await this.openUpstreamAndWriteHead(hookRequest, {
+        onError: onUpstreamError,
       });
-      upstream.on("error", onUpstreamError);
-
-      // Send request line + headers
-      const headerLines: string[] = [];
-      headerLines.push(
-        `${hookRequest.method} ${hookRequest.backendTarget} HTTP/1.1`,
-      );
-      for (const [k, v] of Object.entries(hookRequest.headers)) {
-        if (v === undefined) continue;
-        if (Array.isArray(v)) {
-          for (const vv of v) headerLines.push(`${k}: ${vv}`);
-        } else {
-          headerLines.push(`${k}: ${v}`);
-        }
-      }
-      const headerBlob = headerLines.join("\r\n") + "\r\n\r\n";
-
-      await writeStream(upstream, headerBlob);
 
       // Stream body
       if (hasBody) {
@@ -1377,249 +1465,73 @@ export class IngressGateway {
 
     try {
       if (!this.allowWebSockets) {
-        const body = Buffer.from("websocket upgrades disabled\n", "utf8");
-        this.writeRawHttpResponse(
+        return this.rejectUpgrade(
           socket,
           501,
           "Not Implemented",
-          {
-            "content-type": "text/plain",
-            "content-length": String(body.length),
-            connection: "close",
-          },
-          body,
+          "websocket upgrades disabled\n",
         );
-        socket.destroy();
-        return;
       }
 
       let url: URL;
       try {
         url = new URL(req.url ?? "/", "http://gondolin.local");
       } catch {
-        const body = Buffer.from("bad request\n", "utf8");
-        this.writeRawHttpResponse(
-          socket,
-          400,
-          "Bad Request",
-          {
-            "content-type": "text/plain",
-            "content-length": String(body.length),
-            connection: "close",
-          },
-          body,
-        );
-        socket.destroy();
-        return;
+        return this.rejectUpgrade(socket, 400, "Bad Request", "bad request\n");
       }
 
       const route = this.pickRoute(url.pathname);
       if (!route) {
-        const body = Buffer.from("no route\n", "utf8");
-        this.writeRawHttpResponse(
-          socket,
-          404,
-          "Not Found",
-          {
-            "content-type": "text/plain",
-            "content-length": String(body.length),
-            connection: "close",
-          },
-          body,
-        );
-        socket.destroy();
-        return;
+        return this.rejectUpgrade(socket, 404, "Not Found", "no route\n");
       }
 
       const hooks = this.hooks;
       const clientIp = socket.remoteAddress ?? "";
       const clientMethod = (req.method ?? "GET").toUpperCase();
-      const path = url.pathname + url.search;
       const incoming = normalizeIncomingHeaders(req.headers);
 
       if (clientMethod !== "GET") {
-        const body = Buffer.from("websocket upgrade requires GET\n", "utf8");
-        this.writeRawHttpResponse(
+        return this.rejectUpgrade(
           socket,
           400,
           "Bad Request",
-          {
-            "content-type": "text/plain",
-            "content-length": String(body.length),
-            connection: "close",
-          },
-          body,
+          "websocket upgrade requires GET\n",
         );
-        socket.destroy();
-        return;
       }
 
       if (!this.isWebSocketUpgradeRequest(incoming)) {
-        const body = Buffer.from("expected websocket upgrade\n", "utf8");
-        this.writeRawHttpResponse(
+        return this.rejectUpgrade(
           socket,
           400,
           "Bad Request",
-          {
-            "content-type": "text/plain",
-            "content-length": String(body.length),
-            connection: "close",
-          },
-          body,
+          "expected websocket upgrade\n",
         );
-        socket.destroy();
-        return;
       }
-
-      if (hooks?.isAllowed) {
-        const allowed = await hooks.isAllowed({
-          clientIp,
-          method: clientMethod,
-          path,
-          headers: incoming,
-          route,
-        });
-        if (!allowed) {
-          throw new IngressRequestBlockedError();
-        }
-      }
-
-      const backendPathname = route.stripPrefix
-        ? stripPrefix(url.pathname, route.prefix)
-        : url.pathname;
-
-      let hookRequest: IngressHookRequest = {
-        clientIp,
-        method: clientMethod,
-        path,
-        route,
-        backendHost: "127.0.0.1",
-        backendPort: route.port,
-        backendTarget: backendPathname + url.search,
-        headers: normalizeHeaderRecord(filterHopByHopForUpgrade(incoming)),
-      };
-
-      // No request bodies for WebSocket upgrade.
-      delete hookRequest.headers["content-length"];
-      delete hookRequest.headers["transfer-encoding"];
-      delete hookRequest.headers["expect"];
 
       const hostHeader = joinHeaderValue(incoming["host"]) || "localhost";
-      hookRequest.headers["host"] = hostHeader;
-
-      // Forwarded headers
-      if (clientIp) {
-        const prev = hookRequest.headers["x-forwarded-for"];
-        if (typeof prev === "string" && prev.length > 0) {
-          hookRequest.headers["x-forwarded-for"] = `${prev}, ${clientIp}`;
-        } else {
-          hookRequest.headers["x-forwarded-for"] = clientIp;
-        }
-      }
-      hookRequest.headers["x-forwarded-host"] = hostHeader;
-      hookRequest.headers["x-forwarded-proto"] = "http";
-      if (route.stripPrefix && route.prefix !== "/") {
-        hookRequest.headers["x-forwarded-prefix"] = route.prefix;
-      }
-
-      if (hooks?.onRequest) {
-        const patch = await hooks.onRequest(hookRequest);
-        if (patch) {
-          if (patch.method !== undefined) hookRequest.method = patch.method;
-          if (patch.backendHost !== undefined)
-            hookRequest.backendHost = patch.backendHost;
-          if (patch.backendPort !== undefined)
-            hookRequest.backendPort = patch.backendPort;
-          if (patch.backendTarget !== undefined)
-            hookRequest.backendTarget = patch.backendTarget;
-          if (patch.headers) {
-            hookRequest.headers = applyHeaderPatch(
-              hookRequest.headers,
-              patch.headers,
-            );
-          }
-        }
-      }
-
-      hookRequest.method = (hookRequest.method ?? "GET").toUpperCase();
+      const { hookRequest } = await this.buildUpstreamHookRequest(
+        url,
+        route,
+        hooks,
+        clientIp,
+        clientMethod,
+        incoming,
+        hostHeader,
+        true,
+      );
 
       if (hookRequest.method !== "GET") {
-        const body = Buffer.from("websocket upgrade requires GET\n", "utf8");
-        this.writeRawHttpResponse(
+        return this.rejectUpgrade(
           socket,
           400,
           "Bad Request",
-          {
-            "content-type": "text/plain",
-            "content-length": String(body.length),
-            connection: "close",
-          },
-          body,
-        );
-        socket.destroy();
-        return;
-      }
-
-      if (
-        hookRequest.backendHost !== "127.0.0.1" &&
-        hookRequest.backendHost !== "localhost"
-      ) {
-        throw new Error(
-          `invalid ingress backend host: ${hookRequest.backendHost}`,
+          "websocket upgrade requires GET\n",
         );
       }
 
-      if (
-        !Number.isInteger(hookRequest.backendPort) ||
-        hookRequest.backendPort <= 0 ||
-        hookRequest.backendPort > 65535
-      ) {
-        throw new Error(
-          `invalid ingress backend port: ${hookRequest.backendPort}`,
-        );
-      }
-
-      if (!hookRequest.backendTarget.startsWith("/")) {
-        throw new Error(
-          `invalid ingress backend target: ${hookRequest.backendTarget}`,
-        );
-      }
-
-      // Enforce hop-by-hop filtering after the user hook
-      hookRequest.headers = normalizeHeaderRecord(
-        filterHopByHopForUpgrade(hookRequest.headers as any),
-      );
-
-      // Remove body framing headers; websocket handshakes do not send a body.
-      delete hookRequest.headers["content-length"];
-      delete hookRequest.headers["transfer-encoding"];
-      delete hookRequest.headers["expect"];
-
-      upstream = await this.sandbox.openIngressStream({
-        host: hookRequest.backendHost,
-        port: hookRequest.backendPort,
-        timeoutMs: 2000,
+      upstream = await this.openUpstreamAndWriteHead(hookRequest, {
+        extra: head,
       });
-
-      // Send request line + headers
-      const headerLines: string[] = [];
-      headerLines.push(
-        `${hookRequest.method} ${hookRequest.backendTarget} HTTP/1.1`,
-      );
-      for (const [k, v] of Object.entries(hookRequest.headers)) {
-        if (v === undefined) continue;
-        if (Array.isArray(v)) {
-          for (const vv of v) headerLines.push(`${k}: ${vv}`);
-        } else {
-          headerLines.push(`${k}: ${v}`);
-        }
-      }
-      const headerBlob = headerLines.join("\r\n") + "\r\n\r\n";
-      await writeStream(upstream, headerBlob);
-
-      if (head.length > 0) {
-        await writeStream(upstream, head);
-      }
 
       // Read response head
       const respHead = await readHttpHead(upstream);
@@ -1718,39 +1630,19 @@ export class IngressGateway {
       upstream.on("close", () => destroyBoth());
     } catch (err) {
       if (err instanceof IngressRequestBlockedError) {
-        const body = Buffer.from(err.body, "utf8");
-        this.writeRawHttpResponse(
+        return this.rejectUpgrade(
           socket,
           err.statusCode,
           err.statusMessage,
-          {
-            "content-type": "text/plain",
-            "content-length": String(body.length),
-            connection: "close",
-          },
-          body,
+          err.body,
         );
-        socket.destroy();
-        return;
       }
 
       if (process.env.GONDOLIN_DEBUG) {
         console.error("ingress websocket bad gateway:", err);
       }
 
-      const body = Buffer.from("bad gateway\n", "utf8");
-      this.writeRawHttpResponse(
-        socket,
-        502,
-        "Bad Gateway",
-        {
-          "content-type": "text/plain",
-          "content-length": String(body.length),
-          connection: "close",
-        },
-        body,
-      );
-      socket.destroy();
+      this.rejectUpgrade(socket, 502, "Bad Gateway", "bad gateway\n");
     } finally {
       // `upstream` is intentionally not destroyed here when the tunnel is active;
       // it is owned by the piping/error handlers.
