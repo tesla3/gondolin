@@ -253,6 +253,49 @@ test("qemu-net: parseHttpRequest parses content-length and preserves remaining",
   );
 });
 
+test("qemu-net: parseHttpRequest coalesces duplicate Cookie headers with semicolons", async () => {
+  let captured: any = null;
+
+  const backend = makeBackend({
+    maxHttpBodyBytes: 1024,
+    fetch: async () =>
+      new Response("ok", {
+        status: 200,
+        headers: { "content-length": "2" },
+      }),
+    httpHooks: {
+      onRequest: async (req) => {
+        captured = req;
+        return req;
+      },
+    },
+  });
+
+  const buf = Buffer.from(
+    "GET /path HTTP/1.1\r\n" +
+      "Host: example.com\r\n" +
+      "Cookie: a=1\r\n" +
+      "Cookie: b=2\r\n" +
+      "\r\n",
+  );
+
+  const session: any = { http: undefined };
+  let finished = false;
+
+  await qemuHttp.handleHttpDataWithWriter(backend, "key", session, buf, {
+    scheme: "http",
+    write: () => {},
+    finish: () => {
+      finished = true;
+    },
+  });
+
+  assert.equal(finished, true);
+  assert.ok(captured);
+  assert.equal(captured.headers.host, "example.com");
+  assert.equal(captured.headers.cookie, "a=1; b=2");
+});
+
 test("qemu-net: parseHttpRequest decodes chunked body (and waits for completeness)", async () => {
   let captured: any = null;
 

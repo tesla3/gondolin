@@ -30,28 +30,7 @@ export class HttpRequestBlockedError extends Error {
 
 export function parseHeaderLines(
   lines: Iterable<string>,
-  options: {
-    /** how to handle duplicate headers */
-    merge: "comma";
-    /** reject multiple distinct Content-Length values */
-    strictContentLength?: boolean;
-  },
-): Record<string, string>;
-export function parseHeaderLines(
-  lines: Iterable<string>,
-  options?: {
-    /** how to handle duplicate headers */
-    merge?: "array";
-  },
-): Record<string, string | string[]>;
-export function parseHeaderLines(
-  lines: Iterable<string>,
-  options?: {
-    merge?: "comma" | "array";
-    strictContentLength?: boolean;
-  },
 ): Record<string, string | string[]> {
-  const merge = options?.merge ?? "array";
   const headers: Record<string, string | string[]> = {};
 
   for (const line of lines) {
@@ -64,23 +43,6 @@ export function parseHeaderLines(
 
     const value = line.slice(idx + 1).trim();
 
-    if (merge === "comma") {
-      const prev = headers[key] as string | undefined;
-      if (prev !== undefined) {
-        if (options?.strictContentLength && key === "content-length") {
-          if (prev !== value) {
-            throw new Error("multiple content-length headers");
-          }
-          continue;
-        }
-        headers[key] = `${prev}, ${value}`;
-      } else {
-        headers[key] = value;
-      }
-      continue;
-    }
-
-    // merge === "array"
     const prev = headers[key];
     if (prev === undefined) {
       headers[key] = value;
@@ -92,6 +54,45 @@ export function parseHeaderLines(
   }
 
   return headers;
+}
+
+export function coalesceHeaderRecord(
+  headers: Record<string, string | string[]>,
+): Record<string, string> {
+  // Use WHATWG Headers for coalescing rules (notably Cookie uses `; `
+  // instead of `, `).
+  const h = new Headers();
+
+  for (const [key, value] of Object.entries(headers)) {
+    if (Array.isArray(value)) {
+      for (const v of value) {
+        h.append(key, v);
+      }
+    } else {
+      h.append(key, value);
+    }
+  }
+
+  const out: Record<string, string> = {};
+  for (const [key] of h) {
+    const value = h.get(key);
+    if (value !== null) {
+      out[key.toLowerCase()] = value;
+    }
+  }
+  return out;
+}
+
+export function parseContentLength(
+  raw: string | string[] | undefined,
+): number | null {
+  if (raw === undefined) return null;
+  const rawString = Array.isArray(raw) ? raw.join(",") : raw;
+  const n = Number.parseInt(rawString, 10);
+  if (!Number.isSafeInteger(n) || n < 0) {
+    return null;
+  }
+  return n;
 }
 
 const HOP_BY_HOP_HEADERS = new Set([

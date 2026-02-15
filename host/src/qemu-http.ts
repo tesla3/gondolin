@@ -22,6 +22,8 @@ import {
   HttpReceiveBuffer,
   HttpRequestBlockedError,
   parseHeaderLines,
+  coalesceHeaderRecord,
+  parseContentLength,
   applyRedirectRequest,
   getCheckedDispatcher,
   getRedirectUrl,
@@ -356,8 +358,11 @@ export async function handleHttpDataWithWriter(
         httpSession.buffer.length - head.bodyOffset,
       );
 
+      const rawHeaders = head.headers;
+      const headers = coalesceHeaderRecord(rawHeaders);
+
       // Validate Expect early so we don't send 100-continue for requests we must reject.
-      validateExpectHeader(head.version, head.headers);
+      validateExpectHeader(head.version, headers);
 
       // Asterisk-form (OPTIONS *) is valid HTTP but does not map to a URL fetch.
       if (head.method === "OPTIONS" && head.target === "*") {
@@ -371,10 +376,10 @@ export async function handleHttpDataWithWriter(
       }
 
       // Determine request body framing.
-      const transferEncodingHeader = head.headers["transfer-encoding"];
       let bodyMode: "none" | "content-length" | "chunked" = "none";
       let contentLength = 0;
 
+      const transferEncodingHeader = headers["transfer-encoding"];
       if (transferEncodingHeader) {
         const encodings = transferEncodingHeader
           .split(",")
@@ -395,19 +400,23 @@ export async function handleHttpDataWithWriter(
 
         bodyMode = "chunked";
       } else {
-        const contentLengthRaw = head.headers["content-length"];
-        if (contentLengthRaw) {
-          if (contentLengthRaw.includes(",")) {
-            throw new Error("multiple content-length headers");
-          }
-          contentLength = Number(contentLengthRaw);
-          if (
-            !Number.isFinite(contentLength) ||
-            !Number.isInteger(contentLength) ||
-            contentLength < 0
-          ) {
-            throw new Error("invalid content-length");
-          }
+        const rawContentLength = rawHeaders["content-length"];
+        const parsedContentLength = parseContentLength(rawContentLength);
+
+        // If Content-Length is present but invalid, reject the request instead of
+        // silently treating it as missing (which can cause us to forward malformed
+        // requests upstream).
+        if (rawContentLength !== undefined && parsedContentLength === null) {
+          throw new HttpRequestBlockedError(
+            "invalid content-length",
+            400,
+            "Bad Request",
+          );
+        }
+
+        if (parsedContentLength !== null) {
+          contentLength = parsedContentLength;
+          headers["content-length"] = String(contentLength);
         }
 
         if (contentLength > 0) {
@@ -419,21 +428,21 @@ export async function handleHttpDataWithWriter(
         method: head.method,
         target: head.target,
         version: head.version,
-        headers: head.headers,
+        headers,
         body: Buffer.alloc(0),
       };
 
       const hasUpgrade = (() => {
-        const connection = head.headers["connection"]?.toLowerCase() ?? "";
+        const connection = headers["connection"]?.toLowerCase() ?? "";
         return (
-          Boolean(head.headers["upgrade"]) ||
+          Boolean(headers["upgrade"]) ||
           connection
             .split(",")
             .map((t: string) => t.trim())
             .filter(Boolean)
             .includes("upgrade") ||
-          Boolean(head.headers["sec-websocket-key"]) ||
-          Boolean(head.headers["sec-websocket-version"])
+          Boolean(headers["sec-websocket-key"]) ||
+          Boolean(headers["sec-websocket-version"])
         );
       })();
 
@@ -463,8 +472,8 @@ export async function handleHttpDataWithWriter(
         method: head.method,
         url,
         headers: upgradeIsWebSocket
-          ? stripHopByHopHeadersForWebSocket(head.headers)
-          : stripHopByHopHeaders(head.headers),
+          ? stripHopByHopHeadersForWebSocket(headers)
+          : stripHopByHopHeaders(headers),
         body: null,
       };
 
@@ -517,7 +526,7 @@ export async function handleHttpDataWithWriter(
 
       maybeSend100ContinueFromHead(
         httpSession,
-        head,
+        { version: head.version, headers, bodyOffset: head.bodyOffset },
         bufferedBodyBytes,
         options.write,
       );
@@ -526,7 +535,7 @@ export async function handleHttpDataWithWriter(
         method: head.method,
         target: head.target,
         version: head.version,
-        headers: head.headers,
+        headers,
         bodyOffset: head.bodyOffset,
         hookRequest: headHooked.request,
         hookRequestForBodyHook: headHooked.requestForBodyHook,
@@ -1104,7 +1113,7 @@ function parseHttpHead(buffer: Buffer): {
   method: string;
   target: string;
   version: string;
-  headers: Record<string, string>;
+  headers: Record<string, string | string[]>;
   bodyOffset: number;
 } | null {
   const headerEnd = buffer.indexOf("\r\n\r\n");
@@ -1140,10 +1149,7 @@ function parseHttpHead(buffer: Buffer): {
     throw new Error("invalid request line");
   }
 
-  const headers = parseHeaderLines(lines.slice(1), {
-    merge: "comma",
-    strictContentLength: true,
-  });
+  const headers = parseHeaderLines(lines.slice(1));
 
   return {
     method,

@@ -9,7 +9,7 @@ import type { Duplex, Writable } from "stream";
 
 import type { VirtualProvider } from "./vfs/node";
 import type { SandboxServer } from "./sandbox-server";
-import { parseHeaderLines } from "./http-utils";
+import { parseContentLength, parseHeaderLines } from "./http-utils";
 
 const MAX_LISTENERS_FILE_BYTES = 64 * 1024;
 const MAX_HTTP_HEADER_BYTES = 64 * 1024;
@@ -187,31 +187,6 @@ function parseTransferEncoding(raw: string | string[] | undefined): string[] {
     .split(",")
     .map((x) => x.trim().toLowerCase())
     .filter(Boolean);
-}
-
-function parseContentLength(raw: string | string[] | undefined): number | null {
-  if (raw === undefined) return null;
-
-  const values = Array.isArray(raw) ? raw : [raw];
-  const trimmed = values.map((v) => v.trim());
-
-  // Node may coalesce duplicate headers into a single comma-separated string.
-  if (trimmed.length === 1 && trimmed[0]!.includes(",")) {
-    return null;
-  }
-
-  if (trimmed.some((v) => v.includes(",") || !/^\d+$/.test(v))) {
-    return null;
-  }
-
-  const first = trimmed[0]!;
-  if (!trimmed.every((v) => v === first)) {
-    return null;
-  }
-
-  const n = Number.parseInt(first, 10);
-  if (!Number.isSafeInteger(n) || n < 0) return null;
-  return n;
 }
 
 function filterHopByHop(
@@ -409,7 +384,7 @@ async function readHttpHead(stream: Duplex): Promise<{
       const [statusLine, ...headerLines] = head.split("\r\n");
       if (!statusLine) throw new Error("missing status line");
       const { statusCode, statusMessage } = parseStatusLine(statusLine);
-      const headers = parseHeaderLines(headerLines, { merge: "array" });
+      const headers = parseHeaderLines(headerLines);
       return { statusCode, statusMessage, headers, rest };
     }
 
